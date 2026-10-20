@@ -1,0 +1,17 @@
+# 运行产物（本地练习生成，不入库）
+runs/
+practice-output/
+evidence/
+*.mp4
+*.part
+
+# 打包产物
+agent-submission.zip
+
+# Python
+__pycache__/
+*.pyc
+
+# 系统
+.DS_Store
+Thumbs.db

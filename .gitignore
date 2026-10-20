@@ -1,9 +1,12 @@
-# 运行产物（本地练习生成，不入库）
-runs/
-practice-output/
-evidence/
+# 运行产物（本地练习生成，不入库）；锚定到仓库根，避免误伤 report/evidence/
+/runs/
+/practice-output/
+/evidence/
 *.mp4
 *.part
+
+# 但 report/evidence/ 下的小体积证据文件要入库
+!/report/evidence/
 
 # 打包产物
 agent-submission.zip

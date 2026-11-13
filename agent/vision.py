@@ -162,7 +162,8 @@ def water_offset(obs, min_pixels=30):
     total = sum(c for _, c in scores)
     if total < min_pixels:
         return None
-    peak_x, peak_c = max(scores, key=lambda t: t[1])
-    if peak_c <= 0:
-        return None
-    return (peak_x - W / 2.0) / (W / 2.0)
+    # Use the occupancy centroid rather than the first maximum. A broad,
+    # uniform water surface gives every column the same score; max(scores)
+    # would incorrectly report x=0 (far left) and bypass centered avoidance.
+    centroid = sum(x * count for x, count in scores) / total
+    return (centroid - W / 2.0) / (W / 2.0)

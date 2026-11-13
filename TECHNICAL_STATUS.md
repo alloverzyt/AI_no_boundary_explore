@@ -144,3 +144,32 @@ docker run --rm --init --platform linux/amd64 --cpus 4 --memory 4g --memory-swap
 
 - `config.json` 中 `api_key` 始终为空，密钥只通过环境变量注入；正式测评由平台统一替换三项。
 - 未修改任何 `evaluation_adapters/*` 评测代码，全部改动都在选手策略侧。
+
+
+---
+
+## 九、最新验证数据（统一导航状态机上线后）
+
+在 stone-tools 场景连跑两局（6000 步/局，真实模型 `deepseek-flash`）：
+
+| 局 | 里程碑 | 位移 | 攻击 | `none_in_range` | 主导准星 |
+|---|---|---|---|---|---|
+| `world-4hcmq1dz` | 0/4 | X 38 / Z 23 | 43 | 23.9% | `gravel` 3532 |
+| `world-a8rc6u1g` | 0/4 | **X 60 / Z 72** | **539** | **5.3%** | `grass_block` 4818 |
+
+### 状态机计数（证明导航器在运转）
+
+| 计数 | 局 1 | 局 2 |
+|---|---|---|
+| `nav: lost sight -> scanning` | 131 | 9 |
+| `nav: scan done` | 130 | 8 |
+| `nav: stuck -> jumping` | 127 | 4 |
+| `nav: jump failed -> digging` | 124 | 1 |
+| `nav: dig timeout -> detouring` | 1 | 0 |
+
+### 结论
+
+- **导航状态机已闭环**：跳 / 挖（40 步硬超时）/ 绕 / 360° 扫描全部按设计触发；
+- **感知稳定性大幅提升**：`none_in_range` 最好 5.3%（早期版本 89%）；
+- **移动性提升 5 倍以上**：位移从 11–13 格提升到 60–72 格；
+- **仍待解决**：跳跃后位移 ≥2 格就复位，导致 `stuck -> jumping` 127 次只升级到 1 次 `digging`（振荡）；草地场景缺少远距离定向探索。

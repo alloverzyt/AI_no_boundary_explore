@@ -26,7 +26,7 @@ python -m unittest discover -s tests -v
 python -m py_compile agent/agent.py agent/planner.py agent/model_api.py agent/vision.py agent/minecraft_actions.py
 ```
 
-Both commands pass locally. The Windows host still has no Docker Desktop or WSL2, so the real-world smoke run was executed on a GitHub-hosted Linux runner with the official Docker image. That run completed all 1,500 tutorial steps with zero invalid actions but did not complete the woodcraft objectives; the trace is the evidence that led to item 10 above.
+Both commands pass locally. The Windows host still has no Docker Desktop or WSL2, so the real-world smoke run was executed on a GitHub-hosted Linux runner with the official Docker image. The first run completed 1,500 steps with zero invalid actions but failed to complete woodcraft; after item 10 was fixed, the second run completed all five woodcraft objectives in 1,170 steps, with zero invalid actions and zero deaths. A stone-tools run is now included in the workflow for the next verification pass.
 
 ## Documentation findings
 

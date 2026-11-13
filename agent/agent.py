@@ -77,50 +77,18 @@ class Agent:
         self.leaf_streak = 0
         self.hit_count = 0
         self.table_placed = False
-        self.table_pos = None
         self.plan = None
         self.plan_ttl = 0
-        self.plan_used = 0
         self.heading_lock = False
         self.heading_steps = 0
         self.nav_state = "moving"
         self.nav_anchor = None
         self.nav_count = 0
         self.nav_turns = 0
-        self.nav_move_after_scan = 0
         self.acq_state = "track"
         self.acq_turns = 0
         self.acq_moves = 0
         self.no_sight = 0
-        self.lock_key = None
-        self.lock_hits = 0
-        self.lock_grace = 0
-        self.stuck_steps = 0
-        self.obstacle_tries = 0
-        self.blocked = 0
-        self.blocked_attack = 0
-        self.escape = 0
-        self.look_around = 0
-        self.vision_spin = 0
-        self.arb_cd = 0
-        self.arb_sign = 0
-        self.arb_agree = 0
-        self.walk_anchor = None
-        self.walk_anchor_steps = 0
-        self.walk_state = "normal"
-        self.walk_count = 0
-        self.dig_fail = 0
-        self.place_walk = 0
-        self.tbl_wait = 0
-        self.tbl_steps = 0
-        self.relocate = 0
-        self.tries = 0
-        self.spare_table = False
-        self.spare_deadline = None
-        self._walk_hist = []
-        self._wp_busy = False
-        if not STABLE and planner:
-            self.planner = planner.make_planner(getattr(self, "config", {}))
         pl = getattr(self, "planner", None)
         self.log("reset goals=%s planner=%s" % (self.goals, type(pl).__name__ if pl else "none"))
 
@@ -159,9 +127,34 @@ class Agent:
         if jump:
             a[2] = 1
 
-        # Navigation recovery is owned by ``walk_policy`` and ``nav_step``.
-        # Do not run a second watchdog here: calling nav_step from walk would
-        # advance its phase timer twice and could recurse through walk_policy.
+        # ---- 统一卡住检测（一处改动覆盖全部 25 个裸 walk 调用点）----
+        # 之前 walk_policy 的跳/挖/绕阶梯只在少数路径被调用，
+        # 其余 25 处直接发"前进"，导致 6000 步只挪 11~13 格且超时机制一次不触发。
+        if forward and not getattr(self, "_wp_busy", False):
+            try:
+                p = obs.get("position") or [0, 0, 0]
+                pos = (float(p[0]), float(p[2]))
+            except Exception:
+                pos = None
+            if pos is not None:
+                hist = getattr(self, "_walk_hist", None)
+                if hist is None:
+                    hist = []
+                    self._walk_hist = hist
+                hist.append(pos)
+                if len(hist) > 12:
+                    hist.pop(0)
+                if len(hist) >= 12:
+                    dx = hist[-1][0] - hist[0][0]
+                    dz = hist[-1][1] - hist[0][1]
+                    if (dx * dx + dz * dz) ** 0.5 < 1.0:
+                        self.log("walk() no progress in 12 steps -> walk_policy")
+                        hist.clear()
+                        self._wp_busy = True
+                        try:
+                            return self.nav_step(obs)
+                        finally:
+                            self._wp_busy = False
         return a
 
     def attack(self, obs):
@@ -250,7 +243,14 @@ class Agent:
 
         # ② 目标可见但太远 -> 靠近（卡住时以跳跃为主，每 6 步强制大转向）
         if _is_any(target, group) and dist is not None:
-            return self.walk_policy(obs), True
+            if self.is_stuck(obs):
+                self.stuck_steps = getattr(self, "stuck_steps", 0) + 1
+                if self.stuck_steps % 6 == 0:
+                    self.log("stuck near %s -> big turn" % tag)
+                    return self.turn(obs, amount=6), True
+                return self.walk(obs, forward=1, jump=True), True
+            self.stuck_steps = 0
+            return self.walk(obs, forward=1), True
 
         # ②.5 贴脸障碍 -> 先跳，跳不过再斜向上挖（仅在"长时间没找到目标"后启用）
         #     实测教训：这套逻辑若对所有场景生效，会破坏木制阶段
@@ -299,7 +299,7 @@ class Agent:
         # 距离阈值放到 3.0、且只有真正看不到近处方块时才清零：
         # 实测 world-g3n7c7_v 里距离在 2.0 附近抖动，计数器被反复清零，
         # 6000 步只攻击 19 次，位移仅 3×8 格。
-        if explore and (not STABLE) and dist is not None and dist <= 3.0 and target not in ("", "none_in_range"):
+        if (not STABLE) and dist is not None and dist <= 3.0 and target not in ("", "none_in_range"):
             if target in ("water", "lava", "flowing_water", "flowing_lava"):
                 self.blocked = 0
                 return self.turn(obs, amount=6), False
@@ -451,110 +451,89 @@ class Agent:
 
     # ------------------------------------------------------------ 统一导航状态机
     def nav_step(self, obs):
-        """Single-owner navigation state machine with bounded recovery phases."""
+        """单一状态、单一计时器的导航器（替代原来三套互相打架的计时器）。
+
+        状态：MOVING -> JUMPING(8) -> DIGGING(40) -> DETOURING(10) -> MOVING
+              SCANNING(12 转 = 360°)：连续 10 步看不到方块时优先触发
+        """
         pos = self._p(obs)
         hit = self.hit(obs)
-        target = (hit.get("block_name") or "").lower()
+        target = hit.get("block_name") or ""
         dist = hit.get("block_distance")
         visible = dist is not None and target not in ("", "none_in_range")
 
-        if self.nav_anchor is None:
+        if getattr(self, "nav_anchor", None) is None:
             self.nav_anchor = pos
             self.nav_count = 0
-        self.nav_count += 1
+        self.nav_count = getattr(self, "nav_count", 0) + 1
         moved = self._dist2(pos, self.nav_anchor)
 
-        # Progress ends jump/dig recovery; detours deliberately run their full
-        # course so they do not collapse back into the blocked heading.
-        if moved >= 2.0 and self.nav_state not in ("detouring", "scanning"):
+        # 走够 2 格 -> 复位
+        if moved >= 2.0:
             self.nav_state = "moving"
             self.nav_count = 0
             self.nav_anchor = pos
             self.nav_turns = 0
             self.no_sight = 0
-            self.nav_move_after_scan = 0
-            moved = 0.0
 
+        # 无视野累计
         if visible:
             self.no_sight = 0
-        elif self.nav_state == "moving" and self.nav_move_after_scan <= 0:
-            self.no_sight += 1
+        else:
+            self.no_sight = getattr(self, "no_sight", 0) + 1
 
-        # A failed scan must be followed by a meaningful travel interval. Reset
-        # the sight counter for its duration so the same scan cannot restart on
-        # the next frame.
-        if self.nav_state == "moving" and self.nav_move_after_scan > 0:
-            self.nav_move_after_scan -= 1
-            self.no_sight = 0
-            return self.walk(obs, forward=1)
-
-        if self.nav_state == "moving" and self.no_sight >= 10:
+        # ---- SCANNING：无视野优先于一切行走 ----
+        if self.nav_state != "scanning" and self.no_sight >= 10:
             self.nav_state = "scanning"
             self.nav_count = 0
             self.nav_turns = 0
             self.log("nav: lost sight -> scanning 360")
-
         if self.nav_state == "scanning":
             cur = float((obs.get("orientation") or {}).get("pitch", 0.0))
             if abs(cur) > 10:
                 return self.aim_pitch(obs, 0)
-            self.nav_turns += 1
+            self.nav_turns = getattr(self, "nav_turns", 0) + 1
             if self.nav_turns <= 12:
-                return self.turn(obs, amount=2)
+                return self.turn(obs, amount=2)          # 30° × 12 = 360°
             self.nav_state = "moving"
             self.nav_count = 0
             self.nav_turns = 0
             self.nav_anchor = pos
-            self.no_sight = 0
-            self.nav_move_after_scan = 12
             self.log("nav: scan done -> move")
             return self.walk(obs, forward=1)
 
-        if self.nav_state == "jumping":
-            if self.nav_count <= 8:
+        # ---- 阶梯：12 步挪不动 1 格才开始升级 ----
+        if self.nav_count >= 12 and moved < 1.0:
+            st = self.nav_state
+            if st == "moving":
+                self.nav_state = "jumping"
+                self.nav_count = 0
+                self.log("nav: stuck -> jumping")
                 return self.walk(obs, forward=1, jump=True)
-            self.nav_state = "digging"
-            self.nav_count = 0
-            self.log("nav: jump failed -> digging")
-            return self.aim_pitch(obs, -25)
-
-        if self.nav_state == "digging":
-            if self.nav_count > 40:
-                self.nav_state = "detouring"
+            if st == "jumping":
+                if self.nav_count < 8:
+                    return self.walk(obs, forward=1, jump=True)
+                self.nav_state = "digging"
                 self.nav_count = 0
-                self.log("nav: dig timeout(40) -> detouring")
-                return self.turn(obs, amount=6)
-            if target in ("water", "lava", "flowing_water", "flowing_lava"):
-                self.nav_state = "detouring"
-                self.nav_count = 0
-                self.log("nav: fluid ahead -> detouring")
-                return self.turn(obs, amount=6)
-            cur = float((obs.get("orientation") or {}).get("pitch", 0.0))
-            if cur > -20:
+                self.log("nav: jump failed -> digging")
                 return self.aim_pitch(obs, -25)
-            if dist is not None and float(dist) <= REACH:
-                return self.attack(obs)
-            return self.walk(obs, forward=1, jump=True)
-
-        if self.nav_state == "detouring":
-            if self.nav_count <= 10:
+            if st == "digging":
+                if self.nav_count > 40:
+                    self.nav_state = "detouring"
+                    self.nav_count = 0
+                    self.log("nav: dig timeout(40) -> detouring")
+                    return self.turn(obs, amount=6)
+                if dist is not None and float(dist) <= REACH:
+                    return self.attack(obs)
+                return self.walk(obs, forward=1, jump=True)
+            if st == "detouring":
+                if self.nav_count >= 10:
+                    self.nav_state = "moving"
+                    self.nav_count = 0
+                    self.nav_anchor = pos
+                    self.log("nav: detour done -> moving")
+                    return self.walk(obs, forward=1)
                 return self.walk(obs, forward=1)
-            if self.nav_count <= 13:
-                return self.turn(obs, amount=-4)
-            self.nav_state = "moving"
-            self.nav_count = 0
-            self.nav_anchor = pos
-            self.no_sight = 0
-            self.log("nav: detour done -> moving")
-            return self.walk(obs, forward=1)
-
-        # Enter recovery only from the moving phase. Active phases above use
-        # their own timers and cannot be stranded behind the stuck threshold.
-        if self.nav_state == "moving" and self.nav_count >= 12 and moved < 1.0:
-            self.nav_state = "jumping"
-            self.nav_count = 0
-            self.log("nav: stuck -> jumping")
-            return self.walk(obs, forward=1, jump=True)
 
         return self.walk(obs, forward=1)
 
@@ -663,9 +642,8 @@ class Agent:
             else:
                 self.arb_agree = 0
 
-        # ---- P3：没有需要强制接管的情况 ----
-        # Inventory progression and ordinary exploration must retain control.
-        return None
+        # ---- P2.5：导航状态机（含 360° 重扫）----
+        return self.nav_step(obs)
 
     # ------------------------------------------------------------ 移动执行器
     def _p(self, obs):
@@ -677,22 +655,135 @@ class Agent:
         return ((a[0] - b[0]) ** 2 + (a[2] - b[2]) ** 2) ** 0.5
 
     def walk_policy(self, obs):
-        """Apply safety overrides, then let the single navigator own movement."""
-        override = self.arbitrate(obs)
-        if override is not None:
-            return override
+        """「朝某方向走过去」的分级执行器。
 
-        # Water cannot be mined. Detect it from the legal image observation and
-        # enter the same timed detour state used by other navigation failures.
-        if vision is not None and self.nav_count % 4 == 1:
+        模型只负责给方向，本函数负责**怎么走过去**，按代价从低到高升级：
+            正常前进 → 跳（8 步）→ 抬头斜向上挖（≤40 步）→ 绕路（转 90°走 10 步再转回）
+        每一步都用「相对锚点的净位移」判定是否真的在移动，
+        实测（world-6hsnp8tb）6000 步只挪 3×8 格，就是因为缺这层。
+        """
+        pos = self._p(obs)
+        anchor = getattr(self, "walk_anchor", None)
+        steps = getattr(self, "walk_anchor_steps", 0) + 1
+        state = getattr(self, "walk_state", "normal")
+        count = getattr(self, "walk_count", 0) + 1
+
+        if anchor is None:
+            self.walk_anchor = pos
+            self.walk_anchor_steps = 0
+            self.walk_state = "normal"
+            self.walk_count = 0
+            return self.walk(obs, forward=1)
+
+        moved = self._dist2(pos, anchor)
+        self.walk_anchor_steps = steps
+        self.walk_count = count
+        # 阈值修正：每步约 0.15 格，6 步就有 0.9 格，用 0.5 判据永远不会判卡住
+        # （实测 world-zv9gqk1r：walk stuck 0 次，6000 步净位移仅 3×8 格）。
+        stuck = steps >= 10 and moved < 1.0
+
+        # ---- 锚点只在"真正走出一段"后前移 ----
+        # 修正：原来每步都重置锚点，导致 steps 永远 <6，卡住检测从未触发
+        # （实测 world-rcpexxhn：walk stuck 0 次，6000 步仍只挪 3×9 格）。
+        if moved >= 2.0:
+            self.walk_state = "normal"
+            self.walk_count = 0
+            self.dig_fail = 0            # 真的走出去了才清零
+            self.walk_anchor = pos
+            self.walk_anchor_steps = 0
+            return self.walk(obs, forward=1)
+
+        # ---- 水避障：画面正前方是水/冰 -> 提前绕开 ----
+        # 水无法破坏，撞进去只能反复卡住（实测石器场景 water 700+ 次）。
+        if vision is not None and steps % 4 == 1:
             woff = vision.water_offset(obs)
             if woff is not None and abs(woff) < 0.30:
-                self.nav_state = "detouring"
-                self.nav_count = 0
-                self.nav_anchor = self._p(obs)
                 self.log("water ahead (off=%.2f) -> detour" % woff)
+                self.walk_state = "detour"
+                self.walk_count = 0
+                self.walk_anchor = pos
+                self.walk_anchor_steps = 0
                 return self.turn(obs, amount=6)
-        return self.nav_step(obs)
+
+        # ---- 绕行中：必须走满 10 步 + 回正，不能因为"没卡住"就取消 ----
+        # 实测 world-zici2bez：进入 detour 后立刻被判定"未卡住"复位，
+        # 日志里全是 walk ok (detour -> normal) moved=0.05，绕行从未真正执行。
+        if state == "detour":
+            if count < 10:
+                return self.walk(obs, forward=1)
+            if count < 13:
+                return self.turn(obs, amount=-4)
+            self.log("detour done -> normal")
+            self.walk_state = "normal"
+            self.walk_count = 0
+            self.walk_anchor = pos
+            self.walk_anchor_steps = 0
+            return self.walk(obs, forward=1)
+
+        # ---- 有推进但没走远：继续正常前进，锚点不动 ----
+        if not stuck:
+            if state != "normal":
+                self.log("walk ok (%s -> normal) moved=%.2f" % (state, moved))
+            self.walk_state = "normal"
+            self.walk_count = 0
+            return self.walk(obs, forward=1)
+
+        # ---- 卡住：按阶梯升级 ----
+        if state == "normal":
+            self.walk_state = "jump"
+            self.walk_count = 0
+            self.heading_lock = False
+            self.heading_steps = 0
+            self.log("walk stuck -> jump")
+            return self.walk(obs, forward=1, jump=True)
+
+        if state == "jump":
+            if count < 8:
+                return self.walk(obs, forward=1, jump=True)
+            if getattr(self, "dig_fail", 0) >= 2:
+                # 已经挖失败两次，别再刨了，直接绕
+                self.walk_state = "detour"
+                self.walk_count = 0
+                self.log("walk skip dig (failed %d times) -> detour" % self.dig_fail)
+                return self.turn(obs, amount=6)
+            self.walk_state = "dig"
+            self.walk_count = 0
+            self.log("walk jump failed -> dig up-slope")
+            return self.aim_pitch(obs, -25)
+
+        if state == "dig":
+            # 硬超时：只要准星有方块就会一直 attack，原来 count<40 的出口永远走不到，
+            # 导致 Agent 无限挖阶梯通道（实测 o6qdd3j1：1400 步全在挖石头）。
+            if count > 40:
+                self.dig_fail = getattr(self, "dig_fail", 0) + 1
+                self.walk_state = "detour"
+                self.walk_count = 0
+                self.log("walk dig timeout(40) -> detour (fail=%d)" % self.dig_fail)
+                return self.turn(obs, amount=6)
+            cur = float((obs.get("orientation") or {}).get("pitch", 0.0))
+            if cur > -20:
+                return self.aim_pitch(obs, -25)
+            hit = self.hit(obs)
+            d = hit.get("block_distance")
+            if d is not None and d <= REACH:
+                return self.attack(obs)
+            if count < 40:
+                return self.walk(obs, forward=1, jump=True)
+            self.walk_state = "detour"
+            self.walk_count = 0
+            self.log("walk dig failed -> detour")
+            return self.turn(obs, amount=6)
+
+        # detour：转 90° 走 10 步，再转回约 60°，然后交回正常前进
+        if count < 10:
+            return self.walk(obs, forward=1)
+        if count < 13:
+            return self.turn(obs, amount=-4)
+        self.walk_state = "normal"
+        self.walk_count = 0
+        self.walk_anchor = pos
+        self.walk_anchor_steps = 0
+        return self.walk(obs, forward=1)
 
     # ------------------------------------------------------------ 向下挖竖井
     def dig_down(self, obs):
@@ -727,6 +818,11 @@ class Agent:
         counts, slots, equipped = self.inv(observation)
         hit = self.hit(observation)
         self._track_table(observation)
+
+        # ===== 动作仲裁：一帧只让一个控制器出手 =====
+        _arb = self.arbitrate(observation)
+        if _arb is not None:
+            return _arb
 
         log_n = counts.get("log", 0) + counts.get("log2", 0) + counts.get("wood", 0)
         planks = counts.get("planks", 0)
@@ -848,8 +944,7 @@ class Agent:
                 if want in craftable:
                     return craft_action(observation, want)
                 # 需要工作台：没放就先放一个（复用木制阶段的放置逻辑）
-                if (slots.get("crafting_table") is not None and
-                        (not self.table_placed or not self._near_table(observation))):
+                if not self.table_placed and slots.get("crafting_table") is not None:
                     if not hit.get("block_name") or hit.get("block_name") == "none_in_range":
                         cur_pitch = float((observation.get("orientation") or {}).get("pitch", 0.0))
                         if cur_pitch < 40:
@@ -882,14 +977,7 @@ class Agent:
             return self.dig_down(observation)
 
         # ===== 铁器阶段 =====
-        raw_iron = counts.get("iron_ore", 0)
-        ingots = counts.get("iron_ingot", 0)
-        if raw_iron + ingots < 3:
-            # Smelt any ore that is currently legal before mining more. If the
-            # furnace/fuel is not ready, continue mining rather than issuing an
-            # invalid repeated smelt request forever.
-            if raw_iron and "iron_ingot" in craftable:
-                return craft_action(observation, "iron_ingot")
+        if counts.get("iron_ore", 0) < 1 and counts.get("iron_ingot", 0) < 3:
             if not equipped.get("stone_pickaxe") and slots.get("stone_pickaxe") is not None:
                 return slot_action(observation, "equip", slots["stone_pickaxe"])
             if _is_any((hit.get("block_name") or ""), IRON_BLOCKS) and \
@@ -898,15 +986,11 @@ class Agent:
                 return action
             return self.dig_down(observation)
 
-        if ingots < 3:
-            if "iron_ingot" in craftable:
-                return craft_action(observation, "iron_ingot")
-            return self.noop(observation)
+        if counts.get("iron_ingot", 0) < 3:
+            return craft_action(observation, "iron_ingot")
 
         if counts.get("iron_pickaxe", 0) < 1:
-            if "iron_pickaxe" in craftable:
-                return craft_action(observation, "iron_pickaxe")
-            return self.noop(observation)
+            return craft_action(observation, "iron_pickaxe")
 
         self.log("IRON PICKAXE!")
         return self.noop(observation)

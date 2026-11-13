@@ -16,7 +16,6 @@
   * Token 消耗做下限控制：短提示（约 300 token）+ 短输出（≤120 token）。
 """
 import json
-import os
 import re
 
 # --------------------------------------------------------------------------
@@ -124,22 +123,19 @@ class ModelPlanner:
         self.calls = 0
         self.errors = 0
         self.dead = False          # 连续失败过多 -> 永久降级为规则层
-        self.fallback = HeuristicPlanner()
 
     def decide(self, obs, ctx):
         if self.dead:
-            return self.fallback.decide(obs, ctx)
+            return None
         try:
             reply = self.client.chat(SYSTEM_HINT + "\n\n" + build_prompt(obs, ctx))
             self.calls += 1
             self.errors = 0        # 成功一次就清零
         except Exception:
-            # 官方网关不自动重试；三次失败后 use the local planner rather
-            # than returning an empty decision on every subsequent interval.
+            # 官方网关不自动重试；这里只计数，交回规则层
             self.errors += 1
             if self.errors >= 3:
                 self.dead = True
-                return self.fallback.decide(obs, ctx)
             return None
         dec = parse_decision(reply)
         return dec if dec else repair_decision(reply)
@@ -179,21 +175,9 @@ class HeuristicPlanner:
 
 # --------------------------------------------------------------------------
 def make_planner(config):
-    """Use the model only when a name and a usable credential source exist."""
+    """有可用模型配置就上模型，否则降级为启发式（绝不抛异常）。"""
     model = (config or {}).get("model") or {}
-    if not isinstance(model, dict):
-        return HeuristicPlanner()
-    if str(model.get("name") or "").strip().lower() == "offline":
-        return HeuristicPlanner()
-
-    evaluation_url = os.environ.get("EVALUATION_API_URL")
-    evaluation_token = os.environ.get("EVALUATION_API_TOKEN")
-    if evaluation_url or evaluation_token:
-        has_credentials = bool(evaluation_url and evaluation_token)
-    else:
-        has_credentials = bool(model.get("api_key") or os.environ.get("UESTC_MODEL_API_KEY"))
-
-    has_target = bool(str(model.get("name") or "").strip()) and has_credentials
+    has_target = bool(model.get("api_url")) and bool(model.get("name") or True)
     if has_target:
         try:
             return ModelPlanner(config)

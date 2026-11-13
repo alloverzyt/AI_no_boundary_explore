@@ -71,7 +71,6 @@ class Agent:
 
     def reset(self, goal):
         self.goals = list(goal or [])
-        self.stone_scene = "cobblestone" in self.goals or "furnace" in self.goals
         self.ticks = 0
         self.scan = 0
         self.history = []
@@ -224,25 +223,8 @@ class Agent:
         dist = hit.get("block_distance")
         key = self._block_key(hit)
 
-        foliage = target == "leaves" or target.endswith("_leaves") or target == "leaves2"
-        # Stone-scene recovery owns the action until its bounded phase finishes;
-        # otherwise close leaf hits can starve jump/dig/detour timers.
-        if self.stone_scene and getattr(self, "nav_state", "moving") != "moving":
-            return self.nav_step(obs), False
-        if (self.stone_scene and not explore and up_scan and foliage and
-                dist is not None and dist <= REACH):
-            self.lock_key = None
-            self.lock_hits = 0
-            cur_pitch = float((obs.get("orientation") or {}).get("pitch", 0.0))
-            if cur_pitch > -20:
-                return self.aim_pitch(obs, -25), False
-            return self.turn(obs, amount=1), False
-
         # ① 目标在攻击距离内 -> 持续连击（不转向、不抬头）
-        obstacle_target = _is_any(target, OBSTACLES)
-        if self.stone_scene:
-            obstacle_target = explore and obstacle_target
-        if (_is_any(target, group) or obstacle_target) and dist is not None and dist <= REACH:
+        if (_is_any(target, group) or _is_any(target, OBSTACLES)) and dist is not None and dist <= REACH:
             # 目标换了（上一格已打掉）就重置连击计数
             if key != getattr(self, "lock_key", None):
                 self.lock_key = key
@@ -649,9 +631,7 @@ class Agent:
         dist = hit.get("block_distance")
 
         # ---- P0：看得见就砍（离开树冠遮挡的树干也算）----
-        foliage = target == "leaves" or target.endswith("_leaves") or target == "leaves2"
-        if (dist is not None and float(dist) <= REACH and target in self.ARB_CORE and
-                not (self.stone_scene and foliage)):
+        if dist is not None and float(dist) <= REACH and target in self.ARB_CORE:
             self.no_sight = 0
             self.lock_grace = 3          # 命中即刷新保鲜期
             action, _ = self.seek_and_break(obs, LOG_BLOCKS, "wood", up_scan=True)

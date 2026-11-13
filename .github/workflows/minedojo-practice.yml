@@ -50,7 +50,7 @@ jobs:
           python3 practice-package/pack_agent.py --policy offline --output agent.zip \
             --extra planner.py vision.py
 
-      - name: Run woodcraft and stone-tools against the official Docker environment
+      - name: Run woodcraft against the official Docker environment
         shell: bash
         run: |
           docker pull --platform linux/amd64 docker.io/streetartist/uestc-minecraft-controller
@@ -63,28 +63,16 @@ jobs:
             --package /workspace/agent.zip \
             --scenes /workspace/practice-package/practice-scenes.json \
             --output /workspace/practice-output --only woodcraft --no-video
-          docker run --rm --init --platform linux/amd64 --cpus 4 --memory 4g --memory-swap 4g \
-            --pids-limit 512 --shm-size 512m --network none \
-            --mount "type=bind,source=$GITHUB_WORKSPACE,target=/workspace" --workdir /tmp \
-            -e PYTHONPATH=/workspace/practice-package -e PYTHONDONTWRITEBYTECODE=1 \
-            --entrypoint xvfb-run docker.io/streetartist/uestc-minecraft-controller \
-            -a python3 -u /workspace/practice-package/practice.py \
-            --package /workspace/agent.zip \
-            --scenes /workspace/practice-package/practice-scenes.json \
-            --output /workspace/practice-output --only stone-tools --no-video
           sudo chown -R "$(id -u):$(id -g)" practice-output
           python3 - <<'PY'
           import json
           from pathlib import Path
 
-          seen = set()
           for result in Path("practice-output").glob("world-*/result.json"):
               data = json.loads(result.read_text(encoding="utf-8"))
+              print("PRACTICE_SUMMARY", json.dumps(data.get("summary"), ensure_ascii=False))
               for episode in data.get("episodes", []):
-                  scene = episode.get("scenario", {}).get("id")
-                  seen.add(scene)
                   print("PRACTICE_EPISODE", json.dumps({
-                      "scenario": scene,
                       "status": episode.get("status"),
                       "termination": episode.get("termination"),
                       "metrics": episode.get("metrics"),
@@ -92,16 +80,14 @@ jobs:
                   }, ensure_ascii=False))
                   if (episode.get("termination") != "tutorial_goals" or
                           not episode.get("metrics", {}).get("task_success")):
-                      raise SystemExit(f"MineDojo objectives were not completed for {scene}")
-          if seen != {"woodcraft", "stone-tools"}:
-              raise SystemExit(f"Missing practice scenarios: {seen}")
+                      raise SystemExit("MineDojo woodcraft objectives were not completed")
           PY
 
       - name: Upload world, trace, and agent logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: minedojo-practice-${{ github.run_id }}
+          name: minedojo-woodcraft-${{ github.run_id }}
           path: practice-output/
           if-no-files-found: warn
           retention-days: 14

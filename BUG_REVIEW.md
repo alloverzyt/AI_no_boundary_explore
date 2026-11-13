@@ -16,7 +16,6 @@ This review cross-checked the root README, technical status, technical route, re
 8. **Uniform water was reported as far-left.** Water offset now uses the occupancy centroid, so a broad centered water surface is detected as centered instead of selecting the first tied column.
 9. **Iron progression could request smelting after only one ore.** The iron phase now tracks raw ore plus ingots, only requests legal smelting actions, and avoids repeatedly issuing an invalid iron-pickaxe craft request when the recipe is unavailable.
 10. **Wood search dug ground during the tutorial phase.** The exploratory obstacle fallback was guarded only by `STABLE`, not by its `explore` argument. The real Docker run showed 277 attacks against grass/dirt and no collected wood; the fallback is now restricted to the mining/exploration phase, with a regression test.
-11. **Stone-scene recovery stalled around tree canopies.** The seed-43 trace showed 3,509 attacks dominated by leaves and no inventory; close-leaf P0 interception could starve bounded navigation recovery. A follow-up guard now lets the stone tutorial's active recovery state progress and looks above foliage, while preserving the woodcraft behavior that passed. This change still needs a successful stone-tools replay before it can be considered validated.
 
 ## Validation
 
@@ -27,7 +26,7 @@ python -m unittest discover -s tests -v
 python -m py_compile agent/agent.py agent/planner.py agent/model_api.py agent/vision.py agent/minecraft_actions.py
 ```
 
-Both commands pass locally. The Windows host still has no Docker Desktop or WSL2, so the real-world smoke run was executed on a GitHub-hosted Linux runner with the official Docker image. The first run completed 1,500 steps with zero invalid actions but failed to complete woodcraft; after item 10 was fixed, the second run completed all five woodcraft objectives in 1,170 steps, with zero invalid actions and zero deaths. A stone-tools run is now included in the workflow for the next verification pass.
+Both commands pass locally. Docker Desktop is now installed on the Windows host and the local engine responds, but this network times out connecting to `registry-1.docker.io:443`, so the official image could not be pulled locally. Gameplay validation used the official image on a GitHub-hosted Linux runner. After item 10 above was fixed, a woodcraft run completed all five objectives in 1,170 steps with zero invalid actions or deaths. A later exploratory stone-tools run (seed 43) failed to make progress; that longer chain is not claimed as verified and remains a separate issue.
 
 ## Documentation findings
 

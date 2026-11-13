@@ -111,38 +111,6 @@ class AgentTests(unittest.TestCase):
         for _ in range(5):
             self.assertEqual(self.agent.act(obs)[5], 3)
 
-    def test_wood_phase_looks_past_foliage_instead_of_mining_it(self):
-        self.agent.reset(["wooden_pickaxe", "cobblestone", "stone_pickaxe", "furnace"])
-        obs = observation(block="leaves", distance=2)
-        action = self.agent.act(obs)
-        self.assertNotEqual(action[5], 3)
-        self.assertEqual(action[3], 10)
-        obs["orientation"]["pitch"] = -30
-        action = self.agent.act(obs)
-        self.assertNotEqual(action[5], 3)
-        self.assertEqual(action[4], 13)
-
-    def test_stone_scene_looks_past_foliage_while_navigating(self):
-        self.agent.reset(["wooden_pickaxe", "cobblestone", "stone_pickaxe", "furnace"])
-        action = self.agent.act(observation(block="leaves", distance=2))
-        self.assertNotEqual(action[5], 3)
-        self.assertEqual(action[3], 10)
-
-    def test_stone_scene_recovery_is_not_starved_by_close_leaves(self):
-        self.agent.reset(["wooden_pickaxe", "cobblestone", "stone_pickaxe", "furnace"])
-        self.agent.nav_state = "jumping"
-        obs = observation(block="leaves", distance=2)
-        for _ in range(80):
-            action = self.agent.act(obs)
-            self.assertNotEqual(action[5], 3)
-            if self.agent.nav_state == "moving":
-                break
-        self.assertEqual(self.agent.nav_state, "moving")
-
-    def test_woodcraft_still_mines_trunks_and_foliage(self):
-        action = self.agent.act(observation(block="leaves", distance=2))
-        self.assertEqual(action[5], 3)
-
     def test_wood_phase_does_not_dig_ground_as_an_exploration_obstacle(self):
         action = self.agent.act(observation(block="grass_block", distance=1))
         self.assertNotEqual(action[5], 3)

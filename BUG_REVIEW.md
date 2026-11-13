@@ -16,6 +16,7 @@ This review cross-checked the root README, technical status, technical route, re
 8. **Uniform water was reported as far-left.** Water offset now uses the occupancy centroid, so a broad centered water surface is detected as centered instead of selecting the first tied column.
 9. **Iron progression could request smelting after only one ore.** The iron phase now tracks raw ore plus ingots, only requests legal smelting actions, and avoids repeatedly issuing an invalid iron-pickaxe craft request when the recipe is unavailable.
 10. **Wood search dug ground during the tutorial phase.** The exploratory obstacle fallback was guarded only by `STABLE`, not by its `explore` argument. The real Docker run showed 277 attacks against grass/dirt and no collected wood; the fallback is now restricted to the mining/exploration phase, with a regression test.
+11. **Stone-scene tree canopies reset trunk mining.** Leaves were treated as P0 harvest targets, so alternating leaf/trunk ray hits reset the continuous-break counter. The stone-tools trace showed 732 wood attacks interleaved with 2,777 leaf attacks and no pickup. The arbiter now targets logs only; the wood phase looks upward past foliage instead of attacking it.
 
 ## Validation
 

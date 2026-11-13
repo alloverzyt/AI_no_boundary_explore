@@ -223,8 +223,21 @@ class Agent:
         dist = hit.get("block_distance")
         key = self._block_key(hit)
 
+        # Tree foliage is a view obstruction, not a harvesting target. In the
+        # wood phase, raise the sight line to find the trunk instead of
+        # alternating leaf attacks with trunk attacks and resetting progress.
+        if (not explore and up_scan and _is_any(target, OBSTACLES) and
+                dist is not None and dist <= REACH):
+            self.lock_key = None
+            self.lock_hits = 0
+            cur_pitch = float((obs.get("orientation") or {}).get("pitch", 0.0))
+            if cur_pitch > -20:
+                return self.aim_pitch(obs, -25), False
+            return self.turn(obs, amount=1), False
+
         # ① 目标在攻击距离内 -> 持续连击（不转向、不抬头）
-        if (_is_any(target, group) or _is_any(target, OBSTACLES)) and dist is not None and dist <= REACH:
+        if (_is_any(target, group) or
+                (explore and _is_any(target, OBSTACLES))) and dist is not None and dist <= REACH:
             # 目标换了（上一格已打掉）就重置连击计数
             if key != getattr(self, "lock_key", None):
                 self.lock_key = key
@@ -612,9 +625,7 @@ class Agent:
 
     # ------------------------------------------------------------ 动作仲裁器
     ARB_CORE = ("wood", "log", "oak_log", "birch_log", "spruce_log", "jungle_log",
-                "acacia_log", "dark_oak_log", "leaves", "leaves2", "spruce_leaves",
-                "oak_leaves", "birch_leaves", "jungle_leaves", "acacia_leaves",
-                "dark_oak_leaves")
+                "acacia_log", "dark_oak_log")
 
     def arbitrate(self, obs):
         """动作仲裁器：一帧只允许一个控制器出手。

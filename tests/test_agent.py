@@ -111,6 +111,16 @@ class AgentTests(unittest.TestCase):
         for _ in range(5):
             self.assertEqual(self.agent.act(obs)[5], 3)
 
+    def test_wood_phase_looks_past_foliage_instead_of_mining_it(self):
+        obs = observation(block="leaves", distance=2)
+        action = self.agent.act(obs)
+        self.assertNotEqual(action[5], 3)
+        self.assertEqual(action[3], 10)
+        obs["orientation"]["pitch"] = -30
+        action = self.agent.act(obs)
+        self.assertNotEqual(action[5], 3)
+        self.assertEqual(action[4], 13)
+
     def test_wood_phase_does_not_dig_ground_as_an_exploration_obstacle(self):
         action = self.agent.act(observation(block="grass_block", distance=1))
         self.assertNotEqual(action[5], 3)

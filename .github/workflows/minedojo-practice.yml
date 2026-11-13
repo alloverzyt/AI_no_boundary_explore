@@ -24,6 +24,7 @@ jobs:
         shell: bash
         run: |
           python3 - <<'PY'
+          import json
           import shutil
           import zipfile
           from pathlib import Path
@@ -41,6 +42,10 @@ jobs:
           for name in ("agent.py", "action_items.json", "config.json", "minecraft_actions.py",
                        "model_api.py", "planner.py", "vision.py"):
               shutil.copy2(Path("agent") / name, target / name)
+          config_path = target / "config.json"
+          config = json.loads(config_path.read_text(encoding="utf-8"))
+          config["model"] = {"name": "offline", "api_url": "", "api_key": ""}
+          config_path.write_text(json.dumps(config), encoding="utf-8")
           PY
           python3 practice-package/pack_agent.py --policy offline --output agent.zip \
             --extra planner.py vision.py
@@ -73,6 +78,9 @@ jobs:
                       "metrics": episode.get("metrics"),
                       "objectives": episode.get("objectives"),
                   }, ensure_ascii=False))
+                  if (episode.get("termination") != "tutorial_goals" or
+                          not episode.get("metrics", {}).get("task_success")):
+                      raise SystemExit("MineDojo woodcraft objectives were not completed")
           PY
 
       - name: Upload world, trace, and agent logs

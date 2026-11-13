@@ -111,6 +111,10 @@ class AgentTests(unittest.TestCase):
         for _ in range(5):
             self.assertEqual(self.agent.act(obs)[5], 3)
 
+    def test_wood_phase_does_not_dig_ground_as_an_exploration_obstacle(self):
+        action = self.agent.act(observation(block="grass_block", distance=1))
+        self.assertNotEqual(action[5], 3)
+
     def test_gathering_can_reach_planner(self):
         self.agent.planner = Mock()
         self.agent.planner.decide.return_value = {"goal": "find_tree", "turn": "left", "verb": "walk"}

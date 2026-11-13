@@ -183,6 +183,8 @@ def make_planner(config):
     model = (config or {}).get("model") or {}
     if not isinstance(model, dict):
         return HeuristicPlanner()
+    if str(model.get("name") or "").strip().lower() == "offline":
+        return HeuristicPlanner()
 
     evaluation_url = os.environ.get("EVALUATION_API_URL")
     evaluation_token = os.environ.get("EVALUATION_API_TOKEN")

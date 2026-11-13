@@ -299,7 +299,7 @@ class Agent:
         # 距离阈值放到 3.0、且只有真正看不到近处方块时才清零：
         # 实测 world-g3n7c7_v 里距离在 2.0 附近抖动，计数器被反复清零，
         # 6000 步只攻击 19 次，位移仅 3×8 格。
-        if (not STABLE) and dist is not None and dist <= 3.0 and target not in ("", "none_in_range"):
+        if explore and (not STABLE) and dist is not None and dist <= 3.0 and target not in ("", "none_in_range"):
             if target in ("water", "lava", "flowing_water", "flowing_lava"):
                 self.blocked = 0
                 return self.turn(obs, amount=6), False

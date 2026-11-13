@@ -10,6 +10,13 @@ import planner
 
 
 class PlannerTests(unittest.TestCase):
+    def test_offline_package_never_constructs_model_planner(self):
+        result = planner.make_planner({"model": {
+            "name": "offline", "api_url": "http://127.0.0.1:1",
+            "api_key": "placeholder",
+        }, "agent": {}})
+        self.assertIsInstance(result, planner.HeuristicPlanner)
+
     def test_empty_key_uses_heuristic(self):
         with patch.dict(os.environ, {}, clear=True):
             result = planner.make_planner({"model": {

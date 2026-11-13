@@ -15,6 +15,7 @@ This review cross-checked the root README, technical status, technical route, re
 7. **Planner fallback did not match its documentation.** Planner selection now recognizes evaluation-environment credentials and correctly validates the model name/key. After three model failures, it permanently uses the local heuristic planner.
 8. **Uniform water was reported as far-left.** Water offset now uses the occupancy centroid, so a broad centered water surface is detected as centered instead of selecting the first tied column.
 9. **Iron progression could request smelting after only one ore.** The iron phase now tracks raw ore plus ingots, only requests legal smelting actions, and avoids repeatedly issuing an invalid iron-pickaxe craft request when the recipe is unavailable.
+10. **Wood search dug ground during the tutorial phase.** The exploratory obstacle fallback was guarded only by `STABLE`, not by its `explore` argument. The real Docker run showed 277 attacks against grass/dirt and no collected wood; the fallback is now restricted to the mining/exploration phase, with a regression test.
 
 ## Validation
 
@@ -25,7 +26,7 @@ python -m unittest discover -s tests -v
 python -m py_compile agent/agent.py agent/planner.py agent/model_api.py agent/vision.py agent/minecraft_actions.py
 ```
 
-Both commands pass locally. Docker/MineDojo is not installed in this Windows checkout, so no claim of a full in-game score is made here.
+Both commands pass locally. The Windows host still has no Docker Desktop or WSL2, so the real-world smoke run was executed on a GitHub-hosted Linux runner with the official Docker image. That run completed all 1,500 tutorial steps with zero invalid actions but did not complete the woodcraft objectives; the trace is the evidence that led to item 10 above.
 
 ## Documentation findings
 

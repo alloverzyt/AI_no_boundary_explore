@@ -58,6 +58,22 @@ jobs:
             --package /workspace/agent.zip \
             --scenes /workspace/practice-package/practice-scenes.json \
             --output /workspace/practice-output --only woodcraft --no-video
+          sudo chown -R "$(id -u):$(id -g)" practice-output
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          for result in Path("practice-output").glob("world-*/result.json"):
+              data = json.loads(result.read_text(encoding="utf-8"))
+              print("PRACTICE_SUMMARY", json.dumps(data.get("summary"), ensure_ascii=False))
+              for episode in data.get("episodes", []):
+                  print("PRACTICE_EPISODE", json.dumps({
+                      "status": episode.get("status"),
+                      "termination": episode.get("termination"),
+                      "metrics": episode.get("metrics"),
+                      "objectives": episode.get("objectives"),
+                  }, ensure_ascii=False))
+          PY
 
       - name: Upload world, trace, and agent logs
         if: always()

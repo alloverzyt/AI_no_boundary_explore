@@ -1,5 +1,7 @@
 # 无界杯赛道 B · MineDojo 开放世界智能体 —— 技术现状报告
 
+> **2026-11-14 审查说明**：下文架构与实测数字包含历史迭代记录，不代表当前 HEAD 的复验结果。历史导航统计和末尾结论存在不一致，须以原始运行记录复核；不能据此宣布当前版本通关。当前修复记录见 [BUG_REVIEW.md](BUG_REVIEW.md)，本轮质量目标见 [review/QUALITY_PLAN_2026-11-14.md](review/QUALITY_PLAN_2026-11-14.md)。石器完整流程尚未验收，铁器的熔炉与燃料获取流程仍有缺口。
+
 > 仓库用途：赛道 B（MineDojo 开放世界智能体）参赛代码与实验记录
 > 当前版本：`agent/` 目录下三层架构（ReAct 规划 + 规则执行 + 离线视觉）
 > 实测环境：官方镜像 `streetartist/uestc-minecraft-controller`，本地练习场景 `woodcraft` / `stone-tools`
@@ -121,9 +123,13 @@
 
 ## 七、如何运行
 
+`pack_agent.py`、`practice.py` 和 `practice-scenes.json` 位于归档的官方开发包 ZIP 中，本仓库根目录没有这些入口。先将 `比赛资料库/02_比赛信息整理/官方资料存档/下载/赛道B_智能体开发包.zip` 解压到独立的 `<dev目录>`，把本仓库 `agent/` 的文件覆盖到该目录，再在该目录执行下列命令。打包时必须附带 `planner.py`、`vision.py`，否则导入失败会静默降级。官方题面存档称开发包不含自动打包工具，与当前归档 ZIP 的实际内容不一致；这里按 2026-11-14 对归档 ZIP 的实际检查说明。
+
+本机 Windows 使用 `python` 或 `py`；`python3` 是 Store 存根。Docker 不在 PATH 时使用 `C:\Program Files\Docker\Docker\resources\bin\docker.exe`。以下 PowerShell 命令中的 Docker 镜像可使用本地缓存，容器内仍使用 `python3`。
+
 ```powershell
-# 1) 打包
-python pack_agent.py --policy offline --output agent.zip
+# 1) 在解压并覆盖策略后的 <dev目录> 打包
+python pack_agent.py --policy offline --output agent.zip --extra planner.py vision.py
 
 # 2) 本地练习（无模型，纯规则）
 docker run --rm --init --platform linux/amd64 --cpus 4 --memory 4g --memory-swap 4g `

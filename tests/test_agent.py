@@ -10,16 +10,23 @@ import agent as policy
 from minecraft_actions import CRAFT_ITEMS
 
 
-def observation(items=(), craftable=(), block=None, distance=None):
+def observation(items=(), craftable=(), block=None, distance=None, inventory=None):
     return {
         "noop_action": [0, 0, 0, 12, 12, 0, 0, 0],
-        "inventory": [dict(item_id=name, quantity=count, slot=i, equipped=False)
-                      for i, (name, count) in enumerate(items)],
+        "inventory": (list(inventory) if inventory is not None else
+                      [dict(item_id=name, quantity=count, slot=i, equipped=False)
+                       for i, (name, count) in enumerate(items)]),
         "craftable": list(craftable),
         "position": [0, 64, 0],
         "orientation": {"pitch": 0},
         "crosshair_hit": {"block_name": block, "block_distance": distance},
     }
+
+
+def row(item_id, quantity=1, slot=0, equipped=False):
+    """One public-contract inventory row (same shape the environment sends)."""
+    return {"item_id": item_id, "quantity": quantity, "slot": slot, "equipped": equipped}
+
 
 
 class AgentTests(unittest.TestCase):
@@ -158,6 +165,57 @@ class AgentTests(unittest.TestCase):
         self.agent._walk_hist = [(0, 0)] * 11
         self.agent.nav_step(obs)
         self.assertEqual(self.agent.nav_count, 1)
+
+    # ---------------------------------------------------- 重复槽位装备状态聚合
+    def test_inv_duplicate_equipped_row_first_keeps_equipped(self):
+        counts, slots, equipped = policy.Agent.inv(observation(inventory=[
+            row("wooden_pickaxe", 1, 2, True),
+            row("wooden_pickaxe", 2, 5, False),
+        ]))
+        self.assertEqual(counts["wooden_pickaxe"], 3)
+        self.assertTrue(equipped["wooden_pickaxe"])
+        self.assertEqual(slots["wooden_pickaxe"], 2)
+
+    def test_inv_duplicate_equipped_row_last_uses_equipped_slot(self):
+        counts, slots, equipped = policy.Agent.inv(observation(inventory=[
+            row("wooden_pickaxe", 1, 5, False),
+            row("wooden_pickaxe", 2, 2, True),
+        ]))
+        self.assertEqual(counts["wooden_pickaxe"], 3)
+        self.assertTrue(equipped["wooden_pickaxe"])
+        self.assertEqual(slots["wooden_pickaxe"], 2)
+
+    def test_inv_duplicate_unequipped_keeps_first_available_slot(self):
+        counts, slots, equipped = policy.Agent.inv(observation(inventory=[
+            row("stone_pickaxe", 1, 3, False),
+            row("stone_pickaxe", 2, 6, False),
+        ]))
+        self.assertEqual(counts["stone_pickaxe"], 3)
+        self.assertFalse(equipped["stone_pickaxe"])
+        self.assertEqual(slots["stone_pickaxe"], 3)
+
+    def test_inv_duplicate_state_is_isolated_per_item(self):
+        counts, slots, equipped = policy.Agent.inv(observation(inventory=[
+            row("wooden_pickaxe", 1, 4, False),
+            row("stone_pickaxe", 1, 7, True),
+            row("cobblestone", 2, 9, False),
+        ]))
+        self.assertFalse(equipped["wooden_pickaxe"])
+        self.assertTrue(equipped["stone_pickaxe"])
+        self.assertFalse(equipped["cobblestone"])
+        self.assertEqual(slots, {"wooden_pickaxe": 4, "stone_pickaxe": 7, "cobblestone": 9})
+        self.assertEqual(counts["cobblestone"], 2)
+
+    def test_act_attacks_instead_of_reequipping_with_duplicate_unequipped_row(self):
+        # 已装备行在前、未装备同类行在后：旧 inv 会把 equipped 覆盖成 False，
+        # 于是每步都发 equip(槽位) 而永远不攻击，卡死采矿。
+        self.agent.spare_table = True
+        obs = observation(inventory=[
+            row("wooden_pickaxe", 1, 2, True),
+            row("wooden_pickaxe", 1, 5, False),
+        ], block="stone", distance=2)
+        action = self.agent.act(obs)
+        self.assertEqual(action[5], 3)  # 3=attack；出错时是 5=equip
 
 
 if __name__ == "__main__":

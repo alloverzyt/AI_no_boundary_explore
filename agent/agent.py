@@ -134,9 +134,20 @@ class Agent:
         counts, slots, equipped = {}, {}, {}
         for row in obs.get("inventory", []):
             name = row["item_id"]
+            slot = int(row["slot"])
             counts[name] = counts.get(name, 0) + int(row["quantity"])
-            slots.setdefault(name, int(row["slot"]))
-            equipped[name] = bool(row.get("equipped"))
+            # 同一个 item_id 可能占多个槽位（例如捡到/合成出第二把镐）。
+            # 不能盲信最后一行：若已装备行在前，未装备行在后，旧写法会把
+            # equipped 覆盖回 False，导致每步都重复 equip、永远不攻击；
+            # 也不能固定首槽，否则 equipped 行不是首槽时会反复切到未装备槽。
+            # 聚合规则：同名任一槽位已装备即视为已装备，slots 指向已装备槽；
+            # 全都没装备时 slots 保持首个可用槽。
+            if bool(row.get("equipped")):
+                equipped[name] = True
+                slots[name] = slot
+            else:
+                equipped.setdefault(name, False)
+                slots.setdefault(name, slot)
         return counts, slots, equipped
 
     @staticmethod

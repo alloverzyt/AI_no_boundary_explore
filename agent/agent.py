@@ -1392,6 +1392,13 @@ class Agent:
                 action = self._table_step(observation, counts, slots, craftable)
                 if action is not None:
                     return action
+                # T9：石镐所需圆石已够、但首张工作台在地表且已被消耗时，
+                # 先利用公开 table_pos 有界回台，不能落入 seek wood 死循环。
+                if (want == "stone_pickaxe" and counts.get("crafting_table", 0) == 0
+                        and getattr(self, "table_pos", None) is not None
+                        and not self._near_table(observation)):
+                    self.dep_fail = 0
+                    return self._furnace_return_step(observation)
                 # v5c 实跑缺口：石镐阶段携带台在地下连续 9 次放置失败后，
                 # _table_step 返回 None，主循环落入 dependencies explore，
                 # 从未尝试回台/向上脱困（日志 2776 次 abandoned）。这里显式接入

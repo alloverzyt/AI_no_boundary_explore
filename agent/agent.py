@@ -21,6 +21,8 @@ v7 相对 v6 的两处结构性修正（来自 stone-tools 的失败轨迹 world
     [6] 制作/冶炼物品编号（action_items.json）
     [7] 背包槽位 0..35
 """
+import math
+
 from minecraft_actions import craft_action, slot_action
 
 try:                      # 离线视觉模块（可缺失，缺失则退化为纯规则）
@@ -37,6 +39,7 @@ PLAN_INTERVAL = 40        # 每 40 个环境步问一次规划器
 HEADING_TTL = 240         # 航向上锁后至少直行这么多步才允许重新问方向
 NAV_STILL_LIMIT = 12      # 连续「每步零位移」多少帧算被挡住
 LOG_PICKUP_STEPS = 16     # 原木打掉后走向掉落物捡起的步数（PR6 掉落实测 2~4 格）
+WOOD_BREAK_HITS = 55      # wood 连续攻击阈值：公开轨迹真破坏 60-67 次，假破坏仅 8-10 次
 
 # ---------------------------------------------------------------- 模式开关
 # STABLE=True 时关闭所有"实验性"行为，回到已验证 533 步 5/5 的配置：
@@ -144,6 +147,13 @@ class Agent:
         self.wood_hits = 0
         self.pickup_steps = 0
         self._pickup_base_log = 0
+        self.pickup_target = None
+        self.pickup_last_pos = None
+        self.pickup_stall = 0
+        self.pickup_blocked = 0
+        self.dig_walk_last = None
+        self.dig_walk_stall = 0
+        self.dig_walk_turns = 0
         if not STABLE and planner:
             self.planner = planner.make_planner(getattr(self, "config", {}))
         pl = getattr(self, "planner", None)
@@ -260,8 +270,11 @@ class Agent:
         key = self._block_key(hit)
 
         # 原木被打掉（准星已换格）-> 朝原方向走几步把掉落物捡起来。
+        # 阈值必须足够高：stone-v4 公开轨迹里真破坏需 60-67 次连续攻击，
+        # 而 65/70 次“换格”只是 8-10 次攻击后的假破坏（跳起/准星滑到树叶），
+        # 旧阈值 8 会在这 65 次假事件上启动 pickup 并打断连击。
         if (tag == "wood" and self.wood_key is not None
-                and key != self.wood_key and self.wood_hits >= 8):
+                and key != self.wood_key and self.wood_hits >= WOOD_BREAK_HITS):
             self._start_log_pickup(obs)
             return self.walk(obs, forward=1), True
 
@@ -476,14 +489,87 @@ class Agent:
 
     # ------------------------------------------------------------ 掉落物捡取
     def _start_log_pickup(self, obs):
-        """原木被打掉：朝前方（掉落点方向）走一段把物品捡进背包。"""
+        """原木被打掉：记录掉落点坐标，之后朝该坐标靠近拾取（v5）。
+
+        stone-v4 seed43 公开轨迹：56 次破坏事件只有 1 次在 16 步内拿到 log，
+        movement 朝目标仅 5/56、51/56 净位移为 0 —— 旧实现只“盲目前进 16 步”。
+        """
         self.pickup_steps = LOG_PICKUP_STEPS
         counts, _, _ = self.inv(obs)
         self._pickup_base_log = (counts.get("log", 0) + counts.get("log2", 0)
                                  + counts.get("wood", 0))
+        self.pickup_target = getattr(self, "wood_key", None)
+        self.pickup_last_pos = None
+        self.pickup_stall = 0
+        self.pickup_blocked = 0
         self.wood_key = None
         self.wood_hits = 0
-        self.log("log broken -> walk to drop")
+        self.log("log broken -> pick up at %s" % (self.pickup_target,))
+
+    def _clear_pickup(self):
+        self.pickup_steps = 0
+        self.pickup_target = None
+        self.pickup_last_pos = None
+        self.pickup_stall = 0
+        self.pickup_blocked = 0
+
+    @staticmethod
+    def _yaw_to_point(pos, target):
+        """公开坐标 -> 期望 yaw（由公开 steps 拟合：forward=(-sin(yaw), cos(yaw))）。"""
+        dx = float(target[0]) + 0.5 - float(pos[0])
+        dz = float(target[2]) + 0.5 - float(pos[2])
+        if abs(dx) < 1e-6 and abs(dz) < 1e-6:
+            return None, 0.0
+        return math.degrees(math.atan2(-dx, dz)), (dx * dx + dz * dz) ** 0.5
+
+    def _pickup_step(self, obs):
+        """朝被打掉原木坐标靠近；返回 action，None 表示本次捡取结束。"""
+        target = getattr(self, "pickup_target", None)
+        if target is None or getattr(self, "pickup_steps", 0) <= 0:
+            self._clear_pickup()
+            return None
+        counts, _, _ = self.inv(obs)
+        log_n = counts.get("log", 0) + counts.get("log2", 0) + counts.get("wood", 0)
+        if log_n > self._pickup_base_log:
+            self.log("pickup: log collected")
+            self._clear_pickup()
+            return None
+        pos = self._p(obs)
+        desired, dist = self._yaw_to_point(pos, target)
+        self.pickup_steps -= 1
+        if desired is None or dist <= 1.2:
+            # 已到掉落点附近：站一帧让环境完成拾取，然后结束。
+            self.log("pickup: reached drop point")
+            self._clear_pickup()
+            return self.noop(obs)
+        last = getattr(self, "pickup_last_pos", None)
+        if last is not None and self._dist2(pos, last) < 0.05:
+            self.pickup_stall = getattr(self, "pickup_stall", 0) + 1
+        else:
+            self.pickup_stall = 0
+        self.pickup_last_pos = pos
+        if self.pickup_stall >= 6:
+            self.pickup_stall = 0
+            self.pickup_blocked = getattr(self, "pickup_blocked", 0) + 1
+            if self.pickup_blocked >= 2:
+                self.log("pickup: blocked twice -> give up drop")
+                self._clear_pickup()
+                return None
+            self.log("pickup: blocked -> sidestep")
+            return self.turn(obs, amount=4)
+        if self.pickup_stall >= 3:
+            self.log("pickup: blocked -> jump")
+            return self.walk(obs, forward=1, jump=True)
+        if self.pickup_steps <= 0:
+            self._clear_pickup()
+            return None
+        yaw = float((obs.get("orientation") or {}).get("yaw", 0.0))
+        delta = (desired - yaw + 180.0) % 360.0 - 180.0
+        if abs(delta) > 10.0:
+            step_count = max(-12, min(12, int(round(delta / 15.0))))
+            if step_count:
+                return self.turn(obs, amount=step_count)
+        return self.walk(obs, forward=1)
 
     # ------------------------------------------------------------ 工作台自测距
     def _track_table(self, obs):
@@ -910,6 +996,9 @@ class Agent:
         self.dig_escape = 0
         self.dig_stall = 0
         self.dig_last_key = None
+        self.dig_walk_last = None
+        self.dig_walk_stall = 0
+        self.dig_walk_turns = 0
         self.log("dig_down: repeated failures -> horizontal explore")
         return self.walk_policy(obs)
 
@@ -918,6 +1007,8 @@ class Agent:
         self.dig_escape = 10
         self.dig_stall = 0
         self.dig_last_key = None
+        self.dig_walk_last = None
+        self.dig_walk_stall = 0
         self.lock_key = None
         self.lock_hits = 0
         return self.turn(obs, amount=6)
@@ -969,6 +1060,9 @@ class Agent:
         dist = hit.get("block_distance")
         if dist is not None and dist <= REACH and name not in ("", "none_in_range"):
             key = self._block_key(hit)
+            # 进入攻击分支：walk 停滞状态清零，不影响连续攻击/dig_stall。
+            self.dig_walk_last = None
+            self.dig_walk_stall = 0
             if key != getattr(self, "dig_last_key", None) or self._public_dig_progress(obs):
                 self.dig_stall = 0
             else:
@@ -988,6 +1082,28 @@ class Agent:
             return self.attack(obs)
         self.dig_stall = 0
         self.dig_last_key = None
+        # 目标不在攻击距离：先走过去；公开 position 短窗零位移 -> jump/turn/换路线。
+        pos = self._p(obs)
+        last = getattr(self, "dig_walk_last", None)
+        if last is not None and self._dist2(pos, last) < 0.05:
+            self.dig_walk_stall = getattr(self, "dig_walk_stall", 0) + 1
+        else:
+            self.dig_walk_stall = 0
+            self.dig_walk_turns = 0
+        self.dig_walk_last = pos
+        if self.dig_walk_stall >= 36:
+            self.dig_walk_stall = 0
+            self.dig_walk_last = None
+            self.dig_walk_turns = getattr(self, "dig_walk_turns", 0) + 1
+            if self.dig_walk_turns >= 2:
+                self.dig_walk_turns = 0
+                self.log("dig_down: walk still stalled -> walk_policy")
+                return self.walk_policy(obs)
+            self.log("dig_down: walk stalled x36 -> turn 90")
+            return self.turn(obs, amount=6)
+        if self.dig_walk_stall >= 12:
+            self.log("dig_down: walk stalled x12 -> jump forward")
+            return self.walk(obs, forward=1, jump=True)
         return self.walk(obs, forward=1)            # 脚下没方块就挪一步
 
     # ------------------------------------------------------------ 主循环
@@ -1037,10 +1153,11 @@ class Agent:
             # 原木掉落物捡取优先于继续采集（但别打断可立即完成的木镐合成）。
             if self.pickup_steps > 0 and "wooden_pickaxe" not in craftable:
                 if log_n > self._pickup_base_log:
-                    self.pickup_steps = 0        # 已捡到，立刻恢复正常进度
+                    self._clear_pickup()        # 已捡到，立刻恢复正常进度
                 else:
-                    self.pickup_steps -= 1
-                    return self.walk(observation, forward=1)
+                    action = self._pickup_step(observation)
+                    if action is not None:
+                        return action
             # 换位重放：工作台放下后环境没识别到 -> 先走开一段再放一个新的
             if getattr(self, "relocate", 0) > 0:
                 self.relocate -= 1

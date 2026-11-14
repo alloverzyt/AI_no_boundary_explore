@@ -83,6 +83,10 @@ class WoodcraftStabilityTests(unittest.TestCase):
         """
         base = observation([("planks", 2), ("stick", 4)], ["stick"],
                            position=[-233.81, 69.0, -134.7], pitch=0.0)
+        # v5：pickup 改为朝被打掉原木坐标走，需要公开 yaw 朝向前方掉落点。
+        import math
+        base["orientation"]["yaw"] = math.degrees(math.atan2(
+            -(-237 + 0.5 - (-233.81)), (-135 + 0.5 - (-134.7))))
         wood = hit("wood", 2.27, -237, 70, -135)
         for _ in range(70):
             self.agent.act(dict(base, crosshair_hit=dict(wood)))
@@ -94,11 +98,14 @@ class WoodcraftStabilityTests(unittest.TestCase):
             "broken log must start a bounded walk toward the drop")
         self.assertEqual((action[0], action[5]), (1, 0),
                          "first pickup frame must walk forward, not attack/turn")
-        # 掉落点在前方：连续前进帧
+        # 掉落点在前方：方向对齐时持续接近；fixture 位置恒定（无法真正位移）时
+        # v5 允许有界 jump/sidestep 恢复，但不得攻击。
         actions = [self.agent.act(dict(base, crosshair_hit=dict(far)))
                    for _ in range(6)]
-        self.assertTrue(all(a[0] == 1 and a[5] == 0 for a in actions),
-                        "pickup must be a committed forward approach, got %r" % (actions,))
+        self.assertTrue(all(a[5] == 0 for a in actions),
+                        "pickup must stay non-attacking, got %r" % (actions,))
+        self.assertTrue(any(a[0] == 1 for a in actions),
+                        "pickup must keep moving toward the drop, got %r" % (actions,))
         # 捡到 log：取消 pickup，恢复正常木制进度（这里应立刻合成 planks）
         picked = observation([("planks", 2), ("stick", 4), ("log", 1)], ["planks"],
                              position=[-233.81, 69.0, -134.7], pitch=0.0)

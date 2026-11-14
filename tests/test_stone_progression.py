@@ -326,6 +326,47 @@ class StoneProgressionTests(unittest.TestCase):
         self.agent.act(obs(inventory=inventory, craftable=[]))
         self.assertIsNone(self.agent.spare_deadline)
 
+    # ------------------------------- v5：dig_down walk 分支短窗停滞恢复
+    def test_dig_down_walk_stall_jumps_then_turns(self):
+        # stone-v4 实跑：目标 stone d=4.62>REACH 时 walk 分支连续 851 步原地不动。
+        self.agent.spare_table = True
+        inventory = [row("wooden_pickaxe", 1, 0, True)]
+        base = obs(inventory=inventory, block="stone", distance=4.62, pitch=90.0,
+                   position=(-218.7, 71.0, -41.7))
+        actions = [self.agent.act(base) for _ in range(14)]
+        self.assertTrue(any(a[2] == 1 for a in actions),
+                        msg="12 帧零位移后必须 jump+forward")
+        actions2 = [self.agent.act(base) for _ in range(28)]
+        self.assertTrue(any(a[4] != 12 for a in actions2),
+                        msg="36 帧仍无进展必须转向/换路线")
+
+    def test_dig_down_stall_recovery_does_not_break_continuous_attack(self):
+        # 目标在 REACH 内时保持连续攻击，dig_stall/dig_escape 不参与。
+        self.agent.spare_table = True
+        inventory = [row("wooden_pickaxe", 1, 0, True)]
+        base = obs(inventory=inventory, block="stone", distance=3.6, pitch=90.0,
+                   position=(-218.7, 71.0, -41.7))
+        for _ in range(6):
+            self.assertEqual(self.agent.act(base)[5], 3)
+        self.assertEqual(self.agent.dig_walk_stall, 0)
+
+    def test_reset_clears_v5_pickup_and_walk_state(self):
+        self.agent.pickup_target = (1, 2, 3)
+        self.agent.pickup_last_pos = (1.0, 2.0, 3.0)
+        self.agent.pickup_stall = 4
+        self.agent.pickup_blocked = 1
+        self.agent.dig_walk_last = (1.0, 2.0, 3.0)
+        self.agent.dig_walk_stall = 7
+        self.agent.dig_walk_turns = 2
+        self.agent.reset([])
+        self.assertIsNone(self.agent.pickup_target)
+        self.assertIsNone(self.agent.pickup_last_pos)
+        self.assertEqual(self.agent.pickup_stall, 0)
+        self.assertEqual(self.agent.pickup_blocked, 0)
+        self.assertIsNone(self.agent.dig_walk_last)
+        self.assertEqual(self.agent.dig_walk_stall, 0)
+        self.assertEqual(self.agent.dig_walk_turns, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

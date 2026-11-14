@@ -30,4 +30,92 @@ action[5] 的含义按轨迹与 agent.py 第 492 行推断：3=攻击，4=合成
 
 未解项：第 3394 步 nearby_tools.table 由 True 变 False 时玩家位置没动，只有 yaw 变了。可能与准星是否对着台子有关（agent.py 第 455 行注释也提到过类似现象），本报告不下结论。
 
-<!--NEXT-->
+## 2. 为什么新 near_table / 等待上限后没采到圆石
+
+### 2.1 两个批准修复都在石器分支内，v3 没走到
+
+- 三维 `_near_table`（agent.py 第 461–478 行）只在 `if self.table_placed and self._near_table(observation)`（第 1092 行）等位置被调用，该行位于「石器阶段」（第 1073 行起）。
+- 「最多等 5 步」的 `tbl_steps > 5` 在第 1096–1110 行，同样在石器阶段。
+- v3 的 agent.log 760 行里没有 `stone recipe still missing`、`force place`、`dig_down` 或 `LOCK on stone`。steps.jsonl 4001–6000 步攻击 0 次，准星 0 次命中 stone。
+- v3 与 v2 的区别：v2 背包真实带着备用台，直接进石器分支并采到 3 个圆石，才暴露假近台。v3 没有备用台，被挡在石器分支之前。所以 v3 既没证明修复有效，也没证明无效，这两条没有被执行过。
+
+### 2.2 实际拦路的是备用台阶段（第 1041–1068 行）
+
+进入条件：`wpick >= 1 and spick == 0 and not spare_table`。3369 步合成木镐后即满足。代码流程：
+
+1. `tables >= 1` 才会置 `spare_table=True`。v3 背包里台子已经放下，`tables == 0`，条件不成立。
+2. `deadline is not None and ticks >= deadline` 时只写日志并执行 `self.spare_deadline = None`（第 1055–1057 行），**没有**置 `spare_table=True`，也没有任何「已放弃」标记。
+3. 下一帧回到 `else` 分支：`deadline is None` 就把 deadline 设为 `ticks + 900`（第 1059–1060 行），之后继续囤木。
+4. 囤木要有 log 才能合成 planks。背包没有 log，于是走第 1066 行 `seek_and_break(LOG_BLOCKS, "wood", up_scan=True)`。
+
+时间对账（推断，非日志直接给出）：
+
+- 3369 步拿到木镐，deadline 约为 3369+900=4269。
+- 4270 步出现整局唯一一次 equip（`[0,0,0,12,12,5,0,3]`），符合 deadline 触发后落入石器分支第一帧「先装备镐」的路径（第 1122–1123 行）。
+- 4270 步之后立即回到纯前进。动作桶显示 4501–6000 步没有再出现 equip，equip 只此一次，与「每 900 步重新计时」后又被囤木分支接管一致。
+
+日志对账：agent.log 里 `spare table skipped (deadline)` 只出现在第 519、640 行，而台子放置与确认在第 395–396 行（对应 3368 步），所以这两次 deadline 都发生在放台之后，与 STONE_RUN_V3 §4「只出现 2 次」一致。第 519 行与 4270 步（3369+900）的 equip 在时间顺序上吻合；第 640 行应是 deadline 被重置后的下一轮（约 5170 步前后）。agent.log 没有步数戳，这个步数对应是由顺序与 900 步周期推断的，不是日志直接给出。
+
+### 2.3 囤木为什么推进不了：位置冻结
+
+- 3420 步起位置恒为 (-219.3, 73.0, -48.7)，共 2580 步不动。
+- 准星打在 leaves 上，d=4.76–4.83，大于 `REACH=4.0`（第 57 行）。`seek_and_break` 第 250 行要求 `dist <= REACH` 才会进入「持续攻击」；第 275 行对「目标是 group 内但太远」走 `walk_policy`，而 leaves 不在 `LOG_BLOCKS` 里，所以落入后面的探索分支，行为是继续前进。
+- 前进被树叶墙挡住，位置不变，yaw 在 -135/-150 间来回摆。这个循环没有「位置长时间不变」的检测。
+- 同一冻结在开局 300–1500 步已出现过一次（坐标 (-219.7, 71.0, -37.7) 不变，准星 wood d=4.76），后来是靠其他机制偶然解开。说明这是独立于备用台的、更一般的缺陷。
+
+### 2.4 因果链（压缩）
+
+无备用台 → 备用台阶段不可跳过（deadline 只清空不置位）→ 囤木 → 没有 log 目标且被树叶墙卡住 → 位置冻结到 6000 步 → 从未进入石器分支 → 没有圆石。
+
+## 3. v3 与 v2 对照，以及 deadline 修好后仍会遇到的问题
+
+| 项 | v2 | v3 |
+|---|---|---|
+| 结果 | 2/4（木镐、圆石） | 1/4（仅木镐） |
+| 首个 log | 第 1651 步 | 第 1983 步 |
+| 木镐 | 第 2933 步 | 第 3369 步 |
+| 台子 | 2884 步放在 (-237,79,-42)，背包另带备用台 | 3368 步放下，背包无备用台 |
+| 圆石 | 3040–3127 步采到 3 个 | 0 |
+| 之后 2600–2900 步 | 假近台空转（水平 1.35、垂直 9） | 位置冻结、囤木卡死 |
+
+两次都是「木镐之后台子留在原地，玩家离开」，区别只是 v2 背包里有备用台，v3 没有。v3 的备用台阶段 deadline bug 在 v2 因 `tables >= 1` 而被绕开。
+
+### 3.1 即使 deadline 一次性修复后仍可能失败的点（推断，未实跑）
+
+1. 木镐在 3369 步才拿到，已用 56% 预算。剩余 2631 步要完成采 3 块圆石 + 石镐，再采 8 块圆石 + 熔炉。v2 的竖井每块石头约 29 次攻击（STONE_DIFFICULT_ANALYSIS），仅 11 块就约 320 次攻击，加上下挖、台子往返，预算很紧。
+2. 跳过备用台后，石器分支需要一个可用的台子：台子（3368 步）在 y=76，玩家在 y=73，约高 3 格；采石要下挖到约 y=66，垂直差将超过 `abs(dy) <= 2`，三维 `_near_table` 判 False，`craftable` 也不会含 stone_pickaxe。此时 `_table_step` 需要背包里有台子才能重放；v3 背包没有，只能走第 1111–1119 行的 `dep_fail` 找木头分支，又回到囤木和位置冻结。也就是说，deadline 修好只把问题推后到「采够圆石之后没有台子」，v3 的 4 个目标仍然拿不到。
+3. 木制阶段的位置冻结（见 2.3）在开局和 3420 步后各出现一次，没有通用的「N 步位置不变 → 强制换向/后退/挖开」出口。
+
+## 4. 最小修复方向（只描述，不写代码，不改源码）
+
+按公开轨迹的优先级排列。
+
+1. **备用台 deadline 一次性，且在 v3 之后的修复里已有**：deadline 到点后置 `spare_table=True`（或另设「已放弃」标志），不再重置 900 步。STONE_RUN_V3 §5 称这条已修并有红绿测试。本报告没有读到修复后的源码，只引用该文档，不独立核实。
+2. **通用的「位置冻结」出口**：木制与备用台阶段都要加。公开观测里只要连续 N 步（如 60）`position` 不变且动作几乎全是前进，就强制一次有界脱困：后退几步、大幅转向，或朝最近的 leaves 连击挖开。判据只用 `position` 与 `crosshair_hit`，不依赖私有状态。
+3. **不要对不可达目标发前进**：准星命中 leaves 且 `block_distance > REACH` 时，不应让纯前进成为唯一动作；先转向换视线或挖开挡路的 leaves，再前进。
+4. **台子与采石点的关系要显式处理**：木镐拿到后台子留在 y=76，采石要下到 y≈66。跳过备用台时，圆石攒够后需要「上井、回台旁」或「就地重新合成一张并放置」；否则 `_near_table` 三维化只会把 v2 的假近台空转，变成 v3 的找木头空转。最小做法：木镐完成后立即在背包里保留或再合成一张台子，不依赖 deadline 才放弃。
+5. **预算**：v3 木镐在 3369 步（56%）。修复位置冻结后，开局 300–1500 步的冻结大约浪费 1200 步，按位置冻结出口修好，木镐有可能提前到约 2200 步。这是估算，需要实跑确认。
+6. **运行前后记录 agent.py 哈希**：沿用 STONE_DIFFICULT_ANALYSIS 的建议，并在每份报告里写明跑的是哪个包。
+
+## 5. 回归测试样例（只用公开观测字段，均基于本局真实轨迹）
+
+| ID | 输入（公开字段） | 必须断言 |
+|---|---|---|
+| V3-1 | 复现 3420 步后的冻结：`position=(-219.3,73.0,-48.7)` 不变，`orientation.yaw` 在 -135/-150 间摆动、pitch=-15，`crosshair_hit`=leaves、`block_distance`≈4.76–4.83（>REACH）、traced (-217,75,-53)，inventory=planks 3、stick 2、sapling 2、wooden_pickaxe 1（已装备），`craftable` 仅含 stick/wooden_button/wooden_pressure_plate，`nearby_tools.table=False`，连续喂 120 帧且 position 不变 | 动作序列不得几乎全是纯前进 `[1,0,0,12,12,0,0,0]`；120 帧内必须出现后退、大幅转向或对 leaves 的连击之一；任何相同 (position, yaw, crosshair) 状态下的纯前进连续不超过 60 次 |
+| V3-2 | 同 V3-1 的背包，`ticks` 越过备用台 deadline（模拟 3369+900） | 记录一次「spare table skipped」后，之后 1000 帧内 `spare_deadline` 不得被重新设置；动作不得回到囤木分支；`spare_table` 为 True（或等价的「已放弃」标志） |
+| V3-3 | 开局冻结：`position=(-219.7,71.0,-37.7)` 不变，准星 wood、`block_distance=4.76`、pitch=-30、inventory 为空，连续 300 帧 | 300 帧内位置或 yaw/pitch 必须发生有意义变化，或出现面向 wood 的靠近动作；不得 300 帧全是纯前进 |
+| V3-4 | 木镐刚合成：第 3369 步现场，inventory=planks 3、stick 2、sapling 2、wooden_pickaxe 1，`nearby_tools.table=True`，台在 traced (-220,76,-52) | 不进入无限囤木；要么保留/再合成一张可携带台子，要么给出明确的下井后回台策略；不得依赖 deadline 才放弃 |
+| V3-5 | 石器阶段已进入：玩家 y=66，台子在 y=76（垂直差 10），inventory 含 cobblestone 3、stick 2、planks 3，`craftable` 无 stone_pickaxe，`nearby_tools.table=False` | `_near_table` 判 False；不进入 5 步等待的 noop/turn 空转；背包有台子则放置，否则有界回台或就地合成，且日志可见 |
+| V3-6 | 3368 步放置成功现场：`last_action.action[5]==6`，`inventory_delta.crafting_table=-1`，准星 crafting_table d=2.76 | 判定放置成功，`table_placed=True`，`table_fail=0`；新增的位置冻结出口与 deadline 修复不得误伤首台正常放置 |
+| V3-7 | reset 之后 | `spare_table`、`spare_deadline`、`tbl_steps`、`table_fail`、`dep_fail`、冻结计数器全部清零 |
+
+## 6. 未验证项与限制
+
+- 本报告只做只读分析：没有运行游戏，没有读取修复后的 agent.py，没有读取 v3 之前或之后的其他运行目录。
+- 第 2.2 节里「4270 步 deadline 触发」是由时间对账与 equip 签名推出的推断：agent.log 只有第 519、640 行两条 `spare table skipped (deadline)`，且无步数戳，日志行与具体步数的对应靠顺序和 900 步周期推断，不是直接证据。
+- action[5] 的 3/4/5 含义是由轨迹与代码上下文推断的，只有 6=放置有代码直接佐证。
+- 第 3394 步 `nearby_tools.table` 由 True 变 False 而位置未变，成因未查明。
+- STONE_RUN_V3 §5 所述的 deadline 修复及其红绿测试，本报告只引用、未独立核实。
+- 第 4 节第 5 条的预算估算需要实跑确认；熔炉另需 8 块圆石，竖井每块约 29 次攻击，这部分仍未分析。
+
+REVIEW_COMPLETE

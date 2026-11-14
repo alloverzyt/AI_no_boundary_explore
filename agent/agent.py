@@ -35,6 +35,8 @@ except Exception:
 
 PLAN_INTERVAL = 40        # 每 40 个环境步问一次规划器
 HEADING_TTL = 240         # 航向上锁后至少直行这么多步才允许重新问方向
+NAV_STILL_LIMIT = 12      # 连续「每步零位移」多少帧算被挡住
+LOG_PICKUP_STEPS = 16     # 原木打掉后走向掉落物捡起的步数（PR6 掉落实测 2~4 格）
 
 # ---------------------------------------------------------------- 模式开关
 # STABLE=True 时关闭所有"实验性"行为，回到已验证 533 步 5/5 的配置：
@@ -131,6 +133,17 @@ class Agent:
         self.spare_deadline = None
         self._walk_hist = []
         self._wp_busy = False
+        # 短窗位移进度：anchor 净位移小可能是在走曲线，不能据此判卡住。
+        self.nav_last = None
+        self.nav_still = 0
+        self.nav_sidestep = 0
+        # PR6 根因：木块打掉后掉落在 2~4 格外，旧逻辑直接走开不捡，
+        # 1500 步里打掉多根原木却只拿到 2 个。这里记录正在打的原木块，
+        # 打掉后朝掉落点前进一段把物品真正收进背包。
+        self.wood_key = None
+        self.wood_hits = 0
+        self.pickup_steps = 0
+        self._pickup_base_log = 0
         if not STABLE and planner:
             self.planner = planner.make_planner(getattr(self, "config", {}))
         pl = getattr(self, "planner", None)
@@ -246,8 +259,23 @@ class Agent:
         dist = hit.get("block_distance")
         key = self._block_key(hit)
 
+        # 原木被打掉（准星已换格）-> 朝原方向走几步把掉落物捡起来。
+        if (tag == "wood" and self.wood_key is not None
+                and key != self.wood_key and self.wood_hits >= 8):
+            self._start_log_pickup(obs)
+            return self.walk(obs, forward=1), True
+
         # ① 目标在攻击距离内 -> 持续连击（不转向、不抬头）
         if (_is_any(target, group) or _is_any(target, OBSTACLES)) and dist is not None and dist <= REACH:
+            # PR6 根因：原木破坏耗时约 65 帧。先记下正在打的木块；一旦准星
+            # 换到别的方块（说明这一格被打掉），就走向掉落点捡物品 —— 否则
+            # 掉落物留在 2~4 格外，背包永远拿不到（云端 3/5、本地 run2 3/5）。
+            if tag == "wood" and _is_any(target, group):
+                if key == self.wood_key:
+                    self.wood_hits += 1
+                else:
+                    self.wood_key = key
+                    self.wood_hits = 1
             # 目标换了（上一格已打掉）就重置连击计数
             if key != getattr(self, "lock_key", None):
                 self.lock_key = key
@@ -446,6 +474,17 @@ class Agent:
             return self.turn(obs, amount=1), False
         return self.walk(obs, forward=1), False
 
+    # ------------------------------------------------------------ 掉落物捡取
+    def _start_log_pickup(self, obs):
+        """原木被打掉：朝前方（掉落点方向）走一段把物品捡进背包。"""
+        self.pickup_steps = LOG_PICKUP_STEPS
+        counts, _, _ = self.inv(obs)
+        self._pickup_base_log = (counts.get("log", 0) + counts.get("log2", 0)
+                                 + counts.get("wood", 0))
+        self.wood_key = None
+        self.wood_hits = 0
+        self.log("log broken -> walk to drop")
+
     # ------------------------------------------------------------ 工作台自测距
     def _track_table(self, obs):
         """记录工作台坐标：准星命中 crafting_table 时抓取方块坐标。
@@ -591,6 +630,15 @@ class Agent:
     def nav_step(self, obs):
         """Single-owner navigation state machine with bounded recovery phases."""
         pos = self._p(obs)
+        # 每帧真实位移（而不是相对 anchor 的净位移）才是「被挡住」的直接信号：
+        # 曲线行走时 anchor 净位移可以很小，但每帧仍有位移。
+        delta = 99.0 if self.nav_last is None else self._dist2(pos, self.nav_last)
+        self.nav_last = pos
+        if delta < 0.05:
+            self.nav_still += 1
+        else:
+            self.nav_still = 0
+            self.nav_sidestep = 0
         hit = self.hit(obs)
         target = (hit.get("block_name") or "").lower()
         dist = hit.get("block_distance")
@@ -688,11 +736,34 @@ class Agent:
 
         # Enter recovery only from the moving phase. Active phases above use
         # their own timers and cannot be stranded behind the stuck threshold.
+        # Known limitation: re-anchoring claims progress at moved >= 2.0 while
+        # this stall test needs moved < 1.0, so net movement in [1.0, 2.0) can
+        # keep nav_count growing (PR6 failure trace step 1358-1500). Widening
+        # this bound to <2.0 was measured to regress the verified woodcraft
+        # path (local run 0/5, diverging at step 430), so the anchor rule stays
+        # untouched; the PR6 hard case is instead handled by the per-step
+        # short-window sidestep below (and, in practice, by log-drop pickup).
         if self.nav_state == "moving" and self.nav_count >= 12 and moved < 1.0:
             self.nav_state = "jumping"
             self.nav_count = 0
             self.log("nav: stuck -> jumping")
             return self.walk(obs, forward=1, jump=True)
+
+        # 短窗零位移：前进帧连续没有真实位移说明前方被挡。此时只做轻量
+        # 90 度侧移（不 jump/dig，避免把已经站立的 agent 挖进地下），
+        # 最多换 3 个方向后放行给原逻辑（PR6 失败轨迹 step 1358-1500 的
+        # 143 帧原地前进由此兜底）。
+        if self.nav_state == "moving" and self.nav_still >= NAV_STILL_LIMIT:
+            self.nav_still = 0
+            self.nav_count = 0
+            # 保留原 anchor：死区净位移仍在 [1.0,2.0) 时不应退回 jump/dig，
+            # 只有真正 moved<1.0 的原有卡住逻辑才允许 jump/dig。
+            self.nav_sidestep += 1
+            if self.nav_sidestep <= 3:
+                self.log("nav: blocked walk -> sidestep %d" % self.nav_sidestep)
+                return self.turn(obs, amount=6)
+            self.nav_sidestep = 0
+            return self.walk(obs, forward=1)
 
         return self.walk(obs, forward=1)
 
@@ -963,6 +1034,13 @@ class Agent:
         # 已有更高一级的镐（石镐/铁镐）时不再回退重走木制；官方里程碑是
         # “曾经合法获得”，旧木镐丢失不撤销已有进度（P1-05）。
         if wpick == 0 and spick == 0 and counts.get("iron_pickaxe", 0) == 0:
+            # 原木掉落物捡取优先于继续采集（但别打断可立即完成的木镐合成）。
+            if self.pickup_steps > 0 and "wooden_pickaxe" not in craftable:
+                if log_n > self._pickup_base_log:
+                    self.pickup_steps = 0        # 已捡到，立刻恢复正常进度
+                else:
+                    self.pickup_steps -= 1
+                    return self.walk(observation, forward=1)
             # 换位重放：工作台放下后环境没识别到 -> 先走开一段再放一个新的
             if getattr(self, "relocate", 0) > 0:
                 self.relocate -= 1

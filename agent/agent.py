@@ -21,6 +21,8 @@ v7 相对 v6 的两处结构性修正（来自 stone-tools 的失败轨迹 world
     [6] 制作/冶炼物品编号（action_items.json）
     [7] 背包槽位 0..35
 """
+import math
+
 from minecraft_actions import craft_action, slot_action
 
 try:                      # 离线视觉模块（可缺失，缺失则退化为纯规则）
@@ -35,6 +37,11 @@ except Exception:
 
 PLAN_INTERVAL = 40        # 每 40 个环境步问一次规划器
 HEADING_TTL = 240         # 航向上锁后至少直行这么多步才允许重新问方向
+NAV_STILL_LIMIT = 12      # 连续「每步零位移」多少帧算被挡住
+LOG_PICKUP_STEPS = 16     # 原木打掉后走向掉落物捡起的步数（PR6 掉落实测 2~4 格）
+WOOD_BREAK_HITS = 55      # wood 连续攻击阈值：公开轨迹真破坏 60-67 次，假破坏仅 8-10 次
+FURNACE_PREP_LIMIT = 120   # 石镐后、熔炉前：浅层为便携台找木/补料的有界步数
+FURNACE_RETURN_LIMIT = 120  # 深井无台无料时：回台/向上兜底的有界步数
 
 # ---------------------------------------------------------------- 模式开关
 # STABLE=True 时关闭所有"实验性"行为，回到已验证 533 步 5/5 的配置：
@@ -50,6 +57,9 @@ LOG_BLOCKS = ("wood", "log", "oak_log", "birch_log", "spruce_log", "jungle_log",
 STONE_BLOCKS = ("stone", "cobblestone", "andesite", "granite", "diorite")
 IRON_BLOCKS = ("iron_ore",)
 OBSTACLES = ("leaves", "plant", "vine", "grass_fern")
+UNBREAKABLE_BLOCKS = ("bedrock", "barrier", "command_block", "end_portal_frame")
+LIQUID_BLOCKS = ("water", "flowing_water", "lava", "flowing_lava")
+DIG_STALL_LIMIT = 120     # 连续有效攻击但无公开进展 -> 有界退出竖井（原木约需 60~80 下）
 
 REACH = 4.0
 STUCK_WINDOW = 8
@@ -110,15 +120,46 @@ class Agent:
         self.walk_state = "normal"
         self.walk_count = 0
         self.dig_fail = 0
+        self.dig_stall = 0
+        self.dig_escape = 0
+        self.dig_last_key = None
         self.place_walk = 0
         self.tbl_wait = 0
         self.tbl_steps = 0
         self.relocate = 0
         self.tries = 0
+        self.table_pending = False
+        self.table_pending_slot = None
+        self.table_confirm_wait = 0
+        self.table_fail = 0
+        self.table_abandon_logged = False
+        self.table_recover = None
+        self.dep_fail = 0
         self.spare_table = False
         self.spare_deadline = None
         self._walk_hist = []
         self._wp_busy = False
+        # 短窗位移进度：anchor 净位移小可能是在走曲线，不能据此判卡住。
+        self.nav_last = None
+        self.nav_still = 0
+        self.nav_sidestep = 0
+        # PR6 根因：木块打掉后掉落在 2~4 格外，旧逻辑直接走开不捡，
+        # 1500 步里打掉多根原木却只拿到 2 个。这里记录正在打的原木块，
+        # 打掉后朝掉落点前进一段把物品真正收进背包。
+        self.wood_key = None
+        self.wood_hits = 0
+        self.pickup_steps = 0
+        self._pickup_base_log = 0
+        self.pickup_target = None
+        self.pickup_last_pos = None
+        self.pickup_stall = 0
+        self.pickup_blocked = 0
+        self.dig_walk_last = None
+        self.dig_walk_stall = 0
+        self.dig_walk_turns = 0
+        self.furnace_prep_steps = 0
+        self.furnace_return_steps = 0
+        self.furnace_return_last = None
         if not STABLE and planner:
             self.planner = planner.make_planner(getattr(self, "config", {}))
         pl = getattr(self, "planner", None)
@@ -134,9 +175,20 @@ class Agent:
         counts, slots, equipped = {}, {}, {}
         for row in obs.get("inventory", []):
             name = row["item_id"]
+            slot = int(row["slot"])
             counts[name] = counts.get(name, 0) + int(row["quantity"])
-            slots.setdefault(name, int(row["slot"]))
-            equipped[name] = bool(row.get("equipped"))
+            # 同一个 item_id 可能占多个槽位（例如捡到/合成出第二把镐）。
+            # 不能盲信最后一行：若已装备行在前，未装备行在后，旧写法会把
+            # equipped 覆盖回 False，导致每步都重复 equip、永远不攻击；
+            # 也不能固定首槽，否则 equipped 行不是首槽时会反复切到未装备槽。
+            # 聚合规则：同名任一槽位已装备即视为已装备，slots 指向已装备槽；
+            # 全都没装备时 slots 保持首个可用槽。
+            if bool(row.get("equipped")):
+                equipped[name] = True
+                slots[name] = slot
+            else:
+                equipped.setdefault(name, False)
+                slots.setdefault(name, slot)
         return counts, slots, equipped
 
     @staticmethod
@@ -223,8 +275,26 @@ class Agent:
         dist = hit.get("block_distance")
         key = self._block_key(hit)
 
+        # 原木被打掉（准星已换格）-> 朝原方向走几步把掉落物捡起来。
+        # 阈值必须足够高：stone-v4 公开轨迹里真破坏需 60-67 次连续攻击，
+        # 而 65/70 次“换格”只是 8-10 次攻击后的假破坏（跳起/准星滑到树叶），
+        # 旧阈值 8 会在这 65 次假事件上启动 pickup 并打断连击。
+        if (tag == "wood" and self.wood_key is not None
+                and key != self.wood_key and self.wood_hits >= WOOD_BREAK_HITS):
+            self._start_log_pickup(obs)
+            return self.walk(obs, forward=1), True
+
         # ① 目标在攻击距离内 -> 持续连击（不转向、不抬头）
         if (_is_any(target, group) or _is_any(target, OBSTACLES)) and dist is not None and dist <= REACH:
+            # PR6 根因：原木破坏耗时约 65 帧。先记下正在打的木块；一旦准星
+            # 换到别的方块（说明这一格被打掉），就走向掉落点捡物品 —— 否则
+            # 掉落物留在 2~4 格外，背包永远拿不到（云端 3/5、本地 run2 3/5）。
+            if tag == "wood" and _is_any(target, group):
+                if key == self.wood_key:
+                    self.wood_hits += 1
+                else:
+                    self.wood_key = key
+                    self.wood_hits = 1
             # 目标换了（上一格已打掉）就重置连击计数
             if key != getattr(self, "lock_key", None):
                 self.lock_key = key
@@ -423,6 +493,90 @@ class Agent:
             return self.turn(obs, amount=1), False
         return self.walk(obs, forward=1), False
 
+    # ------------------------------------------------------------ 掉落物捡取
+    def _start_log_pickup(self, obs):
+        """原木被打掉：记录掉落点坐标，之后朝该坐标靠近拾取（v5）。
+
+        stone-v4 seed43 公开轨迹：56 次破坏事件只有 1 次在 16 步内拿到 log，
+        movement 朝目标仅 5/56、51/56 净位移为 0 —— 旧实现只“盲目前进 16 步”。
+        """
+        self.pickup_steps = LOG_PICKUP_STEPS
+        counts, _, _ = self.inv(obs)
+        self._pickup_base_log = (counts.get("log", 0) + counts.get("log2", 0)
+                                 + counts.get("wood", 0))
+        self.pickup_target = getattr(self, "wood_key", None)
+        self.pickup_last_pos = None
+        self.pickup_stall = 0
+        self.pickup_blocked = 0
+        self.wood_key = None
+        self.wood_hits = 0
+        self.log("log broken -> pick up at %s" % (self.pickup_target,))
+
+    def _clear_pickup(self):
+        self.pickup_steps = 0
+        self.pickup_target = None
+        self.pickup_last_pos = None
+        self.pickup_stall = 0
+        self.pickup_blocked = 0
+
+    @staticmethod
+    def _yaw_to_point(pos, target):
+        """公开坐标 -> 期望 yaw（由公开 steps 拟合：forward=(-sin(yaw), cos(yaw))）。"""
+        dx = float(target[0]) + 0.5 - float(pos[0])
+        dz = float(target[2]) + 0.5 - float(pos[2])
+        if abs(dx) < 1e-6 and abs(dz) < 1e-6:
+            return None, 0.0
+        return math.degrees(math.atan2(-dx, dz)), (dx * dx + dz * dz) ** 0.5
+
+    def _pickup_step(self, obs):
+        """朝被打掉原木坐标靠近；返回 action，None 表示本次捡取结束。"""
+        target = getattr(self, "pickup_target", None)
+        if target is None or getattr(self, "pickup_steps", 0) <= 0:
+            self._clear_pickup()
+            return None
+        counts, _, _ = self.inv(obs)
+        log_n = counts.get("log", 0) + counts.get("log2", 0) + counts.get("wood", 0)
+        if log_n > self._pickup_base_log:
+            self.log("pickup: log collected")
+            self._clear_pickup()
+            return None
+        pos = self._p(obs)
+        desired, dist = self._yaw_to_point(pos, target)
+        self.pickup_steps -= 1
+        if desired is None or dist <= 1.2:
+            # 已到掉落点附近：站一帧让环境完成拾取，然后结束。
+            self.log("pickup: reached drop point")
+            self._clear_pickup()
+            return self.noop(obs)
+        last = getattr(self, "pickup_last_pos", None)
+        if last is not None and self._dist2(pos, last) < 0.05:
+            self.pickup_stall = getattr(self, "pickup_stall", 0) + 1
+        else:
+            self.pickup_stall = 0
+        self.pickup_last_pos = pos
+        if self.pickup_stall >= 6:
+            self.pickup_stall = 0
+            self.pickup_blocked = getattr(self, "pickup_blocked", 0) + 1
+            if self.pickup_blocked >= 2:
+                self.log("pickup: blocked twice -> give up drop")
+                self._clear_pickup()
+                return None
+            self.log("pickup: blocked -> sidestep")
+            return self.turn(obs, amount=4)
+        if self.pickup_stall >= 3:
+            self.log("pickup: blocked -> jump")
+            return self.walk(obs, forward=1, jump=True)
+        if self.pickup_steps <= 0:
+            self._clear_pickup()
+            return None
+        yaw = float((obs.get("orientation") or {}).get("yaw", 0.0))
+        delta = (desired - yaw + 180.0) % 360.0 - 180.0
+        if abs(delta) > 10.0:
+            step_count = max(-12, min(12, int(round(delta / 15.0))))
+            if step_count:
+                return self.turn(obs, amount=step_count)
+        return self.walk(obs, forward=1)
+
     # ------------------------------------------------------------ 工作台自测距
     def _track_table(self, obs):
         """记录工作台坐标：准星命中 crafting_table 时抓取方块坐标。
@@ -445,14 +599,230 @@ class Agent:
         if tp is not None:
             p = obs.get("position") or [0, 0, 0]
             dx = float(p[0]) - float(tp[0])
+            dy = float(p[1]) - float(tp[1])
             dz = float(p[2]) - float(tp[2])
-            return (dx * dx + dz * dz) ** 0.5 <= 3.0
+            # 仅 x/z 水平距离会在“下挖后台子留在高处”时误判为旁边
+            # （v2 实跑：水平 1.35、垂直 9，导致 48% 预算空转）。
+            vertical_ok = abs(dy) <= 2.0
+            distance3 = (dx * dx + dy * dy + dz * dz) ** 0.5
+            return vertical_ok and distance3 <= 3.0
         return False
+
+    # ------------------------------------------------------ 工作台确认与依赖恢复
+    @staticmethod
+    def _last_table_placement(obs):
+        """只用公开 last_action 判断上一步放置是否真的消耗了台子/熔炉。
+
+        ``valid`` 只代表 8 维动作向量合法，不代表放置成功；这里只在
+        ``inventory_delta`` 显示台子（或熔炉）数量减少时才视为成功。
+        """
+        last = obs.get("last_action")
+        if not isinstance(last, dict):
+            return None
+        action = last.get("action")
+        if not isinstance(action, list) or len(action) < 6 or action[5] != 6:
+            return None
+        delta = last.get("inventory_delta")
+        if not isinstance(delta, dict):
+            return "failed"
+        if delta.get("crafting_table", 0) < 0 or delta.get("furnace", 0) < 0:
+            return "confirmed"
+        return "failed"
+
+    def _update_table_state(self, obs):
+        """用公开反馈收敛 table_pending；不把历史布尔值当作台子可用。"""
+        if not getattr(self, "table_pending", False):
+            return
+        self.table_confirm_wait = getattr(self, "table_confirm_wait", 0) + 1
+        hit = self.hit(obs)
+        near_table = (hit.get("block_name") == "crafting_table" and
+                      hit.get("block_distance") is not None and
+                      float(hit["block_distance"]) <= REACH)
+        result = self._last_table_placement(obs)
+        if result == "confirmed" or near_table:
+            self.table_pending = False
+            self.table_pending_slot = None
+            self.table_placed = True
+            self.table_fail = 0
+            self.table_abandon_logged = False
+            self.tbl_wait = 0
+            self.log("table placement confirmed")
+            return
+        if result == "failed" or self.table_confirm_wait > 3:
+            self.table_pending = False
+            self.table_pending_slot = None
+            self.table_placed = False
+            self.table_fail = getattr(self, "table_fail", 0) + 1
+            self.tbl_wait = 0
+            # 失败后换姿势：1) 抬头到 55 度找可放置面 2) 转向 3) 换位置。
+            # 直接俯视脚下方块时，放置目标可能与玩家自身位置重叠而必失败
+            # （4593 步实跑里连续 1240 次 place 全部失败即此原因）。
+            move = self.table_fail % 3
+            self.table_recover = "aim" if move == 1 else ("turn" if move == 2 else "walk")
+            self.log("table placement failed/unconfirmed (attempt %d)" % self.table_fail)
+
+    def _send_place(self, obs, slot, label="crafting_table"):
+        self.table_pending = True
+        self.table_pending_slot = slot
+        self.table_confirm_wait = 0
+        self.log("place %s slot=%d (awaiting confirmation)" % (label, slot))
+        action = slot_action(obs, "place", slot)
+        action[3] = 12
+        return action
+
+    def _material_step(self, obs, counts, craftable, want_sticks=False):
+        """缺板/缺棍时只做一个合法制作步；无合法配方返回 None。"""
+        craftable = set(craftable)
+        log_n = counts.get("log", 0) + counts.get("log2", 0) + counts.get("wood", 0)
+        planks = counts.get("planks", 0)
+        sticks = counts.get("stick", 0)
+        if want_sticks:
+            if sticks < 2 and planks >= 2 and "stick" in craftable:
+                return craft_action(obs, "stick")
+            if sticks < 2 and planks < 2 and log_n >= 1 and "planks" in craftable:
+                return craft_action(obs, "planks")
+            return None
+        if planks < 4 and log_n >= 1 and "planks" in craftable:
+            return craft_action(obs, "planks")
+        return None
+
+    @staticmethod
+    def _best_pick(counts):
+        """按 iron > stone > wooden 选当前最高可用镐（S10）。"""
+        for name in ("iron_pickaxe", "stone_pickaxe", "wooden_pickaxe"):
+            if counts.get(name, 0) > 0:
+                return name
+        return None
+
+    def _table_step(self, obs, counts, slots, craftable):
+        """缺台时做一个合法步骤：合成台子 -> 放置并等待公开确认。"""
+        craftable = set(craftable)
+        tables = counts.get("crafting_table", 0)
+        planks = counts.get("planks", 0)
+        log_n = counts.get("log", 0) + counts.get("log2", 0) + counts.get("wood", 0)
+        if tables >= 1:
+            slot = slots.get("crafting_table")
+            if slot is None or self.table_pending:
+                return None
+            if self.table_fail >= 9:
+                if not getattr(self, "table_abandon_logged", False):
+                    self.table_abandon_logged = True
+                    self.log("table placement abandoned after %d failures" % self.table_fail)
+                return None
+            if not self.table_placed or not self._near_table(obs):
+                return self._send_place(obs, slot, "crafting_table")
+            return None
+        if "crafting_table" in craftable and planks >= 4:
+            # 重新做一张新台子：上一张的失败计数与姿势恢复清零。
+            self.table_fail = 0
+            self.table_abandon_logged = False
+            self.table_recover = None
+            return craft_action(obs, "crafting_table")
+        if log_n >= 1 and planks < 4 and "planks" in craftable:
+            return craft_action(obs, "planks")
+        return None
+
+    # ------------------------------------------------------ 熔炉前台子就绪闸门（v5c）
+    def _near_surface(self, obs):
+        """公开 position 判断是否仍接近已知工作台高度（或初始地表）。"""
+        pos = self._p(obs)
+        tp = getattr(self, "table_pos", None)
+        if tp is not None:
+            return pos[1] >= float(tp[1]) - 3.0
+        return pos[1] >= 60.0
+
+    def _furnace_table_step(self, obs, counts, slots, craftable):
+        """石镐后、熔炉前的台子就绪闸门。
+
+        v5b 证据（step 2493）：石镐完成时 tables=0、planks=3、log=0 且离台
+        23.5 格后下挖——井下无树无料，37 次 `explore for wood` 全部无效。
+        这里只在公开 inventory/craftable/position/table_pos 上做有界准备：
+        - 有台或已能在台旁合成 -> 放行（None）；
+        - 有合法材料 -> 先补板/做便携台；
+        - 浅层 -> 有界找 1 个原木补台；
+        - 深井无台无料 -> 有界回台/向上兜底，禁止无限 seek wood。
+        """
+        if counts.get("stone_pickaxe", 0) < 1 or counts.get("furnace", 0) > 0:
+            return None
+        craftable = set(craftable or ())
+        tables = counts.get("crafting_table", 0)
+        planks = counts.get("planks", 0)
+        log_n = counts.get("log", 0) + counts.get("log2", 0) + counts.get("wood", 0)
+        # v5b 2493 反例：石镐完成时台子就在旁边（准星 d=1.76），但背包
+        # tables=0、planks=3、log=0；若仅凭“近台”就放行下挖，就会重演
+        # “离台 23.5 格后再无台无料”的 37 次无效循环。因此近台只有在
+        # 圆石已够当场合熔炉时才放行，否则仍先备好便携台再下井。
+        if tables >= 1:
+            self.furnace_prep_steps = 0
+            self.furnace_return_steps = 0
+            return None
+        if self._near_table(obs) and counts.get("cobblestone", 0) >= 8:
+            self.furnace_prep_steps = 0
+            self.furnace_return_steps = 0
+            return None
+        if "crafting_table" in craftable and planks >= 4:
+            self.table_fail = 0
+            self.furnace_prep_steps = 0
+            self.log("furnace readiness: craft portable table")
+            return craft_action(obs, "crafting_table")
+        if log_n >= 1 and planks < 4 and "planks" in craftable:
+            self.log("furnace readiness: craft planks")
+            return craft_action(obs, "planks")
+        if self._near_surface(obs):
+            if self.furnace_prep_steps < FURNACE_PREP_LIMIT:
+                self.furnace_prep_steps += 1
+                if self.furnace_prep_steps % 20 == 1:
+                    self.log("furnace readiness: surface wood search %d"
+                             % self.furnace_prep_steps)
+                action, _ = self.seek_and_break(obs, LOG_BLOCKS, "wood", up_scan=True)
+                return action
+            self.log("furnace readiness: surface prep timeout -> stop searching")
+            self.furnace_prep_steps = 0
+            return None
+        return self._furnace_return_step(obs)
+
+    def _furnace_return_step(self, obs):
+        """深井无台无料：有界回台/向上兜底（替代无限 explore for wood）。"""
+        self.furnace_return_steps = getattr(self, "furnace_return_steps", 0) + 1
+        if self.furnace_return_steps > FURNACE_RETURN_LIMIT:
+            if self.furnace_return_steps == FURNACE_RETURN_LIMIT + 1:
+                self.log("furnace return: bounded attempts exhausted -> stop seek wood")
+            return self.walk_policy(obs)
+        tp = getattr(self, "table_pos", None)
+        pos = self._p(obs)
+        if tp is not None:
+            desired, dist = self._yaw_to_point(pos, tp)
+            yaw = float((obs.get("orientation") or {}).get("yaw", 0.0))
+            delta = (desired - yaw + 180.0) % 360.0 - 180.0
+            if abs(delta) > 10.0:
+                k = max(-12, min(12, int(round(delta / 15.0))))
+                if k:
+                    self.log("furnace return: turn toward table (d=%.1f)" % dist)
+                    return self.turn(obs, amount=k)
+        last = getattr(self, "furnace_return_last", None)
+        moved = last is not None and self._dist2(pos, last) > 0.05
+        self.furnace_return_last = pos
+        if not moved and self.furnace_return_steps % 3 == 0:
+            self.log("furnace return: blocked -> climb up")
+            cur = float((obs.get("orientation") or {}).get("pitch", 0.0))
+            if cur > -45:
+                return self.aim_pitch(obs, -60)
+            return self.attack(obs)
+        return self.walk(obs, forward=1, jump=(self.furnace_return_steps % 4 == 0))
 
     # ------------------------------------------------------------ 统一导航状态机
     def nav_step(self, obs):
         """Single-owner navigation state machine with bounded recovery phases."""
         pos = self._p(obs)
+        # 每帧真实位移（而不是相对 anchor 的净位移）才是「被挡住」的直接信号：
+        # 曲线行走时 anchor 净位移可以很小，但每帧仍有位移。
+        delta = 99.0 if self.nav_last is None else self._dist2(pos, self.nav_last)
+        self.nav_last = pos
+        if delta < 0.05:
+            self.nav_still += 1
+        else:
+            self.nav_still = 0
+            self.nav_sidestep = 0
         hit = self.hit(obs)
         target = (hit.get("block_name") or "").lower()
         dist = hit.get("block_distance")
@@ -550,11 +920,34 @@ class Agent:
 
         # Enter recovery only from the moving phase. Active phases above use
         # their own timers and cannot be stranded behind the stuck threshold.
+        # Known limitation: re-anchoring claims progress at moved >= 2.0 while
+        # this stall test needs moved < 1.0, so net movement in [1.0, 2.0) can
+        # keep nav_count growing (PR6 failure trace step 1358-1500). Widening
+        # this bound to <2.0 was measured to regress the verified woodcraft
+        # path (local run 0/5, diverging at step 430), so the anchor rule stays
+        # untouched; the PR6 hard case is instead handled by the per-step
+        # short-window sidestep below (and, in practice, by log-drop pickup).
         if self.nav_state == "moving" and self.nav_count >= 12 and moved < 1.0:
             self.nav_state = "jumping"
             self.nav_count = 0
             self.log("nav: stuck -> jumping")
             return self.walk(obs, forward=1, jump=True)
+
+        # 短窗零位移：前进帧连续没有真实位移说明前方被挡。此时只做轻量
+        # 90 度侧移（不 jump/dig，避免把已经站立的 agent 挖进地下），
+        # 最多换 3 个方向后放行给原逻辑（PR6 失败轨迹 step 1358-1500 的
+        # 143 帧原地前进由此兜底）。
+        if self.nav_state == "moving" and self.nav_still >= NAV_STILL_LIMIT:
+            self.nav_still = 0
+            self.nav_count = 0
+            # 保留原 anchor：死区净位移仍在 [1.0,2.0) 时不应退回 jump/dig，
+            # 只有真正 moved<1.0 的原有卡住逻辑才允许 jump/dig。
+            self.nav_sidestep += 1
+            if self.nav_sidestep <= 3:
+                self.log("nav: blocked walk -> sidestep %d" % self.nav_sidestep)
+                return self.turn(obs, amount=6)
+            self.nav_sidestep = 0
+            return self.walk(obs, forward=1)
 
         return self.walk(obs, forward=1)
 
@@ -695,30 +1088,120 @@ class Agent:
         return self.nav_step(obs)
 
     # ------------------------------------------------------------ 向下挖竖井
+    def _dig_give_up(self, obs):
+        """连续恢复失败 -> 放弃当前竖井，交给水平导航换位置。"""
+        self.dig_fail = 0
+        self.dig_escape = 0
+        self.dig_stall = 0
+        self.dig_last_key = None
+        self.dig_walk_last = None
+        self.dig_walk_stall = 0
+        self.dig_walk_turns = 0
+        self.log("dig_down: repeated failures -> horizontal explore")
+        return self.walk_policy(obs)
+
+    def _dig_relocate(self, obs):
+        """不可破坏/液体/无进展：抬头转向离开，有界后再试。"""
+        self.dig_escape = 10
+        self.dig_stall = 0
+        self.dig_last_key = None
+        self.dig_walk_last = None
+        self.dig_walk_stall = 0
+        self.lock_key = None
+        self.lock_hits = 0
+        return self.turn(obs, amount=6)
+
+    @staticmethod
+    def _public_dig_progress(obs):
+        """公开 last_action 是否显示上一步攻击产生了进展（掉落/位移）。"""
+        last = obs.get("last_action")
+        if not isinstance(last, dict):
+            return False
+        action = last.get("action")
+        if not isinstance(action, list) or len(action) < 6 or action[5] != 3:
+            return False
+        delta = last.get("inventory_delta")
+        if isinstance(delta, dict) and delta:
+            return True
+        moved = last.get("position_delta")
+        if isinstance(moved, list):
+            return any(abs(float(v)) > 0.05 for v in moved[:3])
+        return False
+
     def dig_down(self, obs):
         """低头对准脚下方块连续挖，形成 1×1 竖井，直到挖到石头层。
 
         为什么需要它：石头在地下，surface 的 grass/dirt 不在 STONE_BLOCKS 里，
         原来的 seek_and_break 在草原上会一直找不到 stone。
+
+        P1-04：基岩/液体不可挖；同一目标长期无公开进展时必须有界脱困并
+        换路线，而不是原地 yaw 空转到时限。
         """
         hit = self.hit(obs)
         cur = float((obs.get("orientation") or {}).get("pitch", 0.0))
         if cur < 70:
             return self.aim_pitch(obs, 90)          # 先低头到 -90 度（正 pitch=低头）
-        dist = hit.get("block_distance")
         name = (hit.get("block_name") or "")
+        # 已进入脱困：先抬头离开竖井，再交给导航继续走。
+        if getattr(self, "dig_escape", 0) > 0:
+            self.dig_escape -= 1
+            if abs(cur) > 15:
+                return self.aim_pitch(obs, 0)
+            return self.walk(obs, forward=1)
+        # 基岩/液体：不攻击，有界恢复后换路线。
+        if _is_any(name, UNBREAKABLE_BLOCKS) or _is_any(name, LIQUID_BLOCKS):
+            self.dig_fail = getattr(self, "dig_fail", 0) + 1
+            self.log("dig_down: %s is not mineable" % name)
+            if self.dig_fail >= 3:
+                return self._dig_give_up(obs)
+            return self._dig_relocate(obs)
+        dist = hit.get("block_distance")
         if dist is not None and dist <= REACH and name not in ("", "none_in_range"):
             key = self._block_key(hit)
+            # 进入攻击分支：walk 停滞状态清零，不影响连续攻击/dig_stall。
+            self.dig_walk_last = None
+            self.dig_walk_stall = 0
+            if key != getattr(self, "dig_last_key", None) or self._public_dig_progress(obs):
+                self.dig_stall = 0
+            else:
+                self.dig_stall = getattr(self, "dig_stall", 0) + 1
+            self.dig_last_key = key
             if key != getattr(self, "lock_key", None):
                 self.lock_key = key
                 self.lock_hits = 0
                 self.log("dig_down on %s at %s" % (name, key))
             self.lock_hits = getattr(self, "lock_hits", 0) + 1
-            if self.lock_hits > 200:
-                self.lock_key = None
-                self.lock_hits = 0
-                return self.turn(obs, amount=3)
+            if self.lock_hits > 200 or self.dig_stall >= DIG_STALL_LIMIT:
+                self.dig_fail = getattr(self, "dig_fail", 0) + 1
+                self.log("dig_down: no progress (%d hits) -> relocate" % self.lock_hits)
+                if self.dig_fail >= 3:
+                    return self._dig_give_up(obs)
+                return self._dig_relocate(obs)
             return self.attack(obs)
+        self.dig_stall = 0
+        self.dig_last_key = None
+        # 目标不在攻击距离：先走过去；公开 position 短窗零位移 -> jump/turn/换路线。
+        pos = self._p(obs)
+        last = getattr(self, "dig_walk_last", None)
+        if last is not None and self._dist2(pos, last) < 0.05:
+            self.dig_walk_stall = getattr(self, "dig_walk_stall", 0) + 1
+        else:
+            self.dig_walk_stall = 0
+            self.dig_walk_turns = 0
+        self.dig_walk_last = pos
+        if self.dig_walk_stall >= 36:
+            self.dig_walk_stall = 0
+            self.dig_walk_last = None
+            self.dig_walk_turns = getattr(self, "dig_walk_turns", 0) + 1
+            if self.dig_walk_turns >= 2:
+                self.dig_walk_turns = 0
+                self.log("dig_down: walk still stalled -> walk_policy")
+                return self.walk_policy(obs)
+            self.log("dig_down: walk stalled x36 -> turn 90")
+            return self.turn(obs, amount=6)
+        if self.dig_walk_stall >= 12:
+            self.log("dig_down: walk stalled x12 -> jump forward")
+            return self.walk(obs, forward=1, jump=True)
         return self.walk(obs, forward=1)            # 脚下没方块就挪一步
 
     # ------------------------------------------------------------ 主循环
@@ -727,6 +1210,19 @@ class Agent:
         counts, slots, equipped = self.inv(observation)
         hit = self.hit(observation)
         self._track_table(observation)
+        self._update_table_state(observation)
+        if getattr(self, "table_pending", False):
+            return self.noop(observation)
+        # 放置失败后先做一个有界的换姿势动作，再重试，避免原地死循环。
+        recovery = getattr(self, "table_recover", None)
+        if recovery is not None:
+            self.table_recover = None
+            self.log("table recovery: %s" % recovery)
+            if recovery == "aim":
+                return self.aim_pitch(observation, 55)
+            if recovery == "turn":
+                return self.turn(observation, amount=6)
+            return self.walk(observation, forward=1)
 
         log_n = counts.get("log", 0) + counts.get("log2", 0) + counts.get("wood", 0)
         planks = counts.get("planks", 0)
@@ -749,7 +1245,17 @@ class Agent:
         # 重要：只用 observation["craftable"]（环境给出的合法可合成列表）作为
         # 权威信号——因为 nearby_tools.table 实测恒为 False，不能作为判据。
         craftable = set(observation.get("craftable") or [])
-        if wpick == 0:
+        # 已有更高一级的镐（石镐/铁镐）时不再回退重走木制；官方里程碑是
+        # “曾经合法获得”，旧木镐丢失不撤销已有进度（P1-05）。
+        if wpick == 0 and spick == 0 and counts.get("iron_pickaxe", 0) == 0:
+            # 原木掉落物捡取优先于继续采集（但别打断可立即完成的木镐合成）。
+            if self.pickup_steps > 0 and "wooden_pickaxe" not in craftable:
+                if log_n > self._pickup_base_log:
+                    self._clear_pickup()        # 已捡到，立刻恢复正常进度
+                else:
+                    action = self._pickup_step(observation)
+                    if action is not None:
+                        return action
             # 换位重放：工作台放下后环境没识别到 -> 先走开一段再放一个新的
             if getattr(self, "relocate", 0) > 0:
                 self.relocate -= 1
@@ -759,7 +1265,13 @@ class Agent:
             # 顺序很重要：先把已有的工作台放出去，再做别的。
             # （v20 的教训：把「木板<9 就砍树」放最前，会在做完台子后
             #   因为木板降到 3 又回去砍树，台子永远躺在背包里 -> 放置 0 次）
-            if tables >= 1 and not self.table_placed:
+            if tables >= 1 and not self.table_placed and not self.table_pending:
+                if self.table_fail >= 3:
+                    self.table_fail = 0
+                    self.table_abandon_logged = False
+                    self.relocate = 12
+                    self.log("table placement failed 3x -> relocate and retry")
+                    return self.walk(observation, forward=1)
                 slot = slots.get("crafting_table")
                 if slot is None:
                     return self.noop(observation)
@@ -771,14 +1283,22 @@ class Agent:
                     if self.place_walk % 3 == 0:
                         return self.turn(observation, amount=3)
                     return self.walk(observation, forward=1)
-                a = slot_action(observation, "place", slot)
-                self.table_placed = True
-                a[3] = 12
-                self.log("place crafting_table")
-                return a
+                return self._send_place(observation, slot, "crafting_table")
 
             if "wooden_pickaxe" in craftable:
                 return craft_action(observation, "wooden_pickaxe")
+
+            # 等待工作台被识别期间仍要补料：木板/木棍不依赖台子，必须放在
+            # tbl_wait 之前，否则“放台后 60 步只走不补料”（P1-03）。
+            if log_n >= 1 and planks < 9 and "planks" in craftable:
+                return craft_action(observation, "planks")
+            if sticks < 2 and planks >= 2 and "stick" in craftable:
+                return craft_action(observation, "stick")
+            # 做工作台必须留够木镐的材料：
+            # 实测 world-ym20nayz 里工作台放下了、nearby_tools 也真了 104 步，
+            # 但因为只剩 2 个木板，craftable 里始终没有木镐。
+            if tables == 0 and planks >= 7 and sticks >= 2 and "crafting_table" in craftable:
+                return craft_action(observation, "crafting_table")
 
             if self.table_placed:
                 # 刚放下工作台时，环境的 craftable 掩码要等观测刷新才更新，
@@ -805,16 +1325,6 @@ class Agent:
                     return self.turn(observation, amount=3)
                 return self.walk(observation, forward=1)
 
-            # 原木 -> 木板（重排阶梯时曾漏掉这一步，导致背包全是原木却不做木板）
-            if log_n >= 1 and planks < 9 and "planks" in craftable:
-                return craft_action(observation, "planks")
-            if sticks < 2 and planks >= 2 and "stick" in craftable:
-                return craft_action(observation, "stick")
-            # 做工作台必须留够木镐的材料：
-            # 实测 world-ym20nayz 里工作台放下了、nearby_tools 也真了 104 步，
-            # 但因为只剩 2 个木板，craftable 里始终没有木镐。
-            if tables == 0 and planks >= 7 and sticks >= 2 and "crafting_table" in craftable:
-                return craft_action(observation, "crafting_table")
             # 材料不够 -> 砍树（顺便把木板攒到 9）
             action, _ = self.seek_and_break(observation, LOG_BLOCKS, "wood", up_scan=True)
             return action
@@ -824,52 +1334,113 @@ class Agent:
         # 做一个「随身工作台」，到矿区就地放下就地合成，省掉回程。
         if wpick >= 1 and spick == 0 and not getattr(self, "spare_table", False):
             craftable = set(observation.get("craftable") or [])
-            if getattr(self, "spare_deadline", None) is None:
-                self.spare_deadline = self.ticks + 900      # 最多再花 900 步囤料
-            if self.ticks < self.spare_deadline:
+            # S04：成品 recipe 已可用时优先制作，不让备用台囤料挡路。
+            if "stone_pickaxe" in craftable:
+                return craft_action(observation, "stone_pickaxe")
+            if "furnace" in craftable:
+                return craft_action(observation, "furnace")
+            # S05：只有背包真实携带 crafting_table 才认为有便携台；
+            # 发出 craft 请求本身不代表成功（下一帧由 inventory 确认）。
+            deadline = getattr(self, "spare_deadline", None)
+            if tables >= 1:
+                self.spare_table = True
+                self.spare_deadline = None
+                self.log("portable table carried (%d) -> continue" % tables)
+            elif deadline is not None and self.ticks >= deadline:
+                # 跳过是一次性决定：不能清空 deadline（否则下一帧又重置 900 步
+                # 重启囤木；stone-v3 实跑因此卡在找树 2600+ 步）。
+                self.log("spare table skipped (deadline)")
+                self.spare_table = True
+                self.spare_deadline = None
+            else:
+                if deadline is None:
+                    self.spare_deadline = self.ticks + 900      # 最多再花 900 步囤料
                 if "crafting_table" in craftable and planks >= 4:
-                    self.spare_table = True
-                    self.log("craft spare crafting_table (portable)")
+                    self.log("craft portable crafting_table")
                     return craft_action(observation, "crafting_table")
                 if log_n >= 1 and "planks" in craftable:
                     return craft_action(observation, "planks")
-                action, _ = self.seek_and_break(observation, LOG_BLOCKS, "wood", up_scan=True)
+                action, _ = self.seek_and_break(observation, LOG_BLOCKS, "wood",
+                                                up_scan=True)
                 return action
-            self.log("spare table skipped (deadline)")
 
         # ===== 石器阶段 =====
         # 目标：cobblestone×3 → stone_pickaxe；再 cobblestone×8 → furnace
         # 关键：石头在地下，必须「向下挖」；且挖石头前要手持镐子。
         if spick == 0 or furnace == 0:
             need = 3 if spick == 0 else 8
-            pick_name = "wooden_pickaxe" if spick == 0 else "stone_pickaxe"
+            pick_name = self._best_pick(counts) or (
+                "wooden_pickaxe" if spick == 0 else "stone_pickaxe")
+            want = "stone_pickaxe" if spick == 0 else "furnace"
+            # v5c：石镐后、熔炉前先确保台子就绪（有界准备/回台），
+            # 避免下井后 tables=0、planks<4、无木可捡的 37 次无效 seek wood。
+            if spick >= 1 and furnace == 0:
+                action = self._furnace_table_step(observation, counts, slots, craftable)
+                if action is not None:
+                    return action
             if cobble >= need:
-                want = "stone_pickaxe" if spick == 0 else "furnace"
                 if want in craftable:
                     return craft_action(observation, want)
-                # 需要工作台：没放就先放一个（复用木制阶段的放置逻辑）
-                if (slots.get("crafting_table") is not None and
-                        (not self.table_placed or not self._near_table(observation))):
-                    if not hit.get("block_name") or hit.get("block_name") == "none_in_range":
-                        cur_pitch = float((observation.get("orientation") or {}).get("pitch", 0.0))
-                        if cur_pitch < 40:
-                            return self.aim_pitch(observation, 55)
-                        self.place_walk = getattr(self, "place_walk", 0) + 1
-                        if self.place_walk % 3 == 0:
-                            return self.turn(observation, amount=3)
-                        return self.walk(observation, forward=1)
-                    a = slot_action(observation, "place", slots["crafting_table"])
-                    self.table_placed = True
-                    a[3] = 12
-                    self.log("place crafting_table (stone phase)")
-                    return a
-                if not self.table_placed and "crafting_table" in craftable:
-                    return craft_action(observation, "crafting_table")
-                # 已有工作台却没解锁 -> 走近一点再试
-                self.tbl_steps = getattr(self, "tbl_steps", 0) + 1
-                if self.tbl_steps % 10 == 0:
-                    return self.turn(observation, amount=3)
-                return self.walk(observation, forward=1)
+                # P1-02：缺木棍时先用合法配方补木板/棍（只做一个合法步）。
+                if want == "stone_pickaxe" and sticks < 2:
+                    action = self._material_step(observation, counts, craftable,
+                                                 want_sticks=True)
+                    if action is not None:
+                        return action
+                # P1-02/P1-03：需要台子时合法合成/放置并等待公开确认；
+                # 历史 table_placed=True 不再被当作“台子可用”。
+                action = self._table_step(observation, counts, slots, craftable)
+                if action is not None:
+                    return action
+                # T9：石镐所需圆石已够、但首张工作台在地表且已被消耗时，
+                # 先利用公开 table_pos 有界回台，不能落入 seek wood 死循环。
+                if (want == "stone_pickaxe" and counts.get("crafting_table", 0) == 0
+                        and getattr(self, "table_pos", None) is not None
+                        and not self._near_table(observation)):
+                    self.dep_fail = 0
+                    return self._furnace_return_step(observation)
+                # v5c 实跑缺口：石镐阶段携带台在地下连续 9 次放置失败后，
+                # _table_step 返回 None，主循环落入 dependencies explore，
+                # 从未尝试回台/向上脱困（日志 2776 次 abandoned）。这里显式接入
+                # 有界回台/向上兜底；若已回到台旁则清零失败计数、重试合成。
+                if counts.get("crafting_table", 0) >= 1 and self.table_fail >= 9:
+                    if self._near_table(observation):
+                        self.table_fail = 0
+                        self.table_abandon_logged = False
+                        self.furnace_return_steps = 0
+                        self.dep_fail = 0
+                        self.log("table abandon: near table again -> retry craft")
+                    else:
+                        self.dep_fail = 0
+                        return self._furnace_return_step(observation)
+                if self.table_placed and self._near_table(observation):
+                    # 台子真实在旁但 recipe 未刷新：最多等 5 步；之后必须行动。
+                    # 有备用台 -> 强制在公开姿势/位置放置（不再无限 noop/dig）；
+                    # 没备用台 -> 继续采矿（craftable 仍是唯一配方权威）。
+                    self.tbl_steps = getattr(self, "tbl_steps", 0) + 1
+                    if self.tbl_steps > 5:
+                        self.tbl_steps = 0
+                        slot = slots.get("crafting_table")
+                        if slot is not None and not self.table_pending:
+                            self.table_placed = False
+                            self.log("stone recipe missing near table -> force place carried table")
+                            return self._send_place(observation, slot,
+                                                    "crafting_table (force)")
+                        self.log("stone recipe still missing; no carried table -> continue mining")
+                        self.dep_fail = 0
+                        return self.dig_down(observation)
+                    if self.tbl_steps % 2 == 0:
+                        return self.noop(observation)
+                    return self.turn(observation, amount=1)
+                # 没有可用台子也没有合法补料步骤 -> 有界找木头重建；超预算换路线。
+                self.dep_fail = getattr(self, "dep_fail", 0) + 1
+                if self.dep_fail <= 80:
+                    action, _ = self.seek_and_break(observation, LOG_BLOCKS, "wood",
+                                                    up_scan=True)
+                    return action
+                self.log("stone dependencies unavailable -> explore for wood")
+                self.dep_fail = 0
+                return self.walk_policy(observation)
 
             # 还没攒够圆石：先装备镐，然后向下挖
             if not equipped.get(pick_name) and slots.get(pick_name) is not None:
@@ -890,8 +1461,10 @@ class Agent:
             # invalid repeated smelt request forever.
             if raw_iron and "iron_ingot" in craftable:
                 return craft_action(observation, "iron_ingot")
-            if not equipped.get("stone_pickaxe") and slots.get("stone_pickaxe") is not None:
-                return slot_action(observation, "equip", slots["stone_pickaxe"])
+            best_pick = self._best_pick(counts)
+            if (best_pick and not equipped.get(best_pick)
+                    and slots.get(best_pick) is not None):
+                return slot_action(observation, "equip", slots[best_pick])
             if _is_any((hit.get("block_name") or ""), IRON_BLOCKS) and \
                hit.get("block_distance") is not None and hit["block_distance"] <= REACH:
                 action, _ = self.seek_and_break(observation, IRON_BLOCKS, "iron_ore", explore=True)

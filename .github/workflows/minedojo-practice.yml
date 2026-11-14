@@ -6,6 +6,7 @@ on:
     paths:
       - "agent/**"
       - "tests/**"
+      - "scripts/**"
       - ".github/workflows/minedojo-practice.yml"
   workflow_dispatch:
 
@@ -13,7 +14,31 @@ permissions:
   contents: read
 
 jobs:
+  offline-tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Check out the PR revision
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install optional test dependency
+        run: python -m pip install --upgrade pip pillow
+
+      - name: Run offline unit tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Byte-compile policy and validator modules
+        run: |
+          python -m py_compile agent/agent.py agent/planner.py agent/model_api.py \
+            agent/vision.py agent/minecraft_actions.py scripts/validate_practice.py
+
   woodcraft:
+    needs: offline-tests
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
@@ -63,25 +88,12 @@ jobs:
             --package /workspace/agent.zip \
             --scenes /workspace/practice-package/practice-scenes.json \
             --output /workspace/practice-output --only woodcraft --no-video
-          sudo chown -R "$(id -u):$(id -g)" practice-output
-          python3 - <<'PY'
-          import json
-          from pathlib import Path
 
-          for result in Path("practice-output").glob("world-*/result.json"):
-              data = json.loads(result.read_text(encoding="utf-8"))
-              print("PRACTICE_SUMMARY", json.dumps(data.get("summary"), ensure_ascii=False))
-              for episode in data.get("episodes", []):
-                  print("PRACTICE_EPISODE", json.dumps({
-                      "status": episode.get("status"),
-                      "termination": episode.get("termination"),
-                      "metrics": episode.get("metrics"),
-                      "objectives": episode.get("objectives"),
-                  }, ensure_ascii=False))
-                  if (episode.get("termination") != "tutorial_goals" or
-                          not episode.get("metrics", {}).get("task_success")):
-                      raise SystemExit("MineDojo woodcraft objectives were not completed")
-          PY
+      - name: Validate the woodcraft practice results
+        shell: bash
+        run: |
+          sudo chown -R "$(id -u):$(id -g)" practice-output
+          python3 scripts/validate_practice.py --output practice-output
 
       - name: Upload world, trace, and agent logs
         if: always()

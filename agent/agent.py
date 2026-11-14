@@ -40,6 +40,8 @@ HEADING_TTL = 240         # 航向上锁后至少直行这么多步才允许重�
 NAV_STILL_LIMIT = 12      # 连续「每步零位移」多少帧算被挡住
 LOG_PICKUP_STEPS = 16     # 原木打掉后走向掉落物捡起的步数（PR6 掉落实测 2~4 格）
 WOOD_BREAK_HITS = 55      # wood 连续攻击阈值：公开轨迹真破坏 60-67 次，假破坏仅 8-10 次
+FURNACE_PREP_LIMIT = 120   # 石镐后、熔炉前：浅层为便携台找木/补料的有界步数
+FURNACE_RETURN_LIMIT = 120  # 深井无台无料时：回台/向上兜底的有界步数
 
 # ---------------------------------------------------------------- 模式开关
 # STABLE=True 时关闭所有"实验性"行为，回到已验证 533 步 5/5 的配置：
@@ -130,6 +132,7 @@ class Agent:
         self.table_pending_slot = None
         self.table_confirm_wait = 0
         self.table_fail = 0
+        self.table_abandon_logged = False
         self.table_recover = None
         self.dep_fail = 0
         self.spare_table = False
@@ -154,6 +157,9 @@ class Agent:
         self.dig_walk_last = None
         self.dig_walk_stall = 0
         self.dig_walk_turns = 0
+        self.furnace_prep_steps = 0
+        self.furnace_return_steps = 0
+        self.furnace_return_last = None
         if not STABLE and planner:
             self.planner = planner.make_planner(getattr(self, "config", {}))
         pl = getattr(self, "planner", None)
@@ -638,6 +644,7 @@ class Agent:
             self.table_pending_slot = None
             self.table_placed = True
             self.table_fail = 0
+            self.table_abandon_logged = False
             self.tbl_wait = 0
             self.log("table placement confirmed")
             return
@@ -698,7 +705,9 @@ class Agent:
             if slot is None or self.table_pending:
                 return None
             if self.table_fail >= 9:
-                self.log("table placement abandoned after %d failures" % self.table_fail)
+                if not getattr(self, "table_abandon_logged", False):
+                    self.table_abandon_logged = True
+                    self.log("table placement abandoned after %d failures" % self.table_fail)
                 return None
             if not self.table_placed or not self._near_table(obs):
                 return self._send_place(obs, slot, "crafting_table")
@@ -706,11 +715,100 @@ class Agent:
         if "crafting_table" in craftable and planks >= 4:
             # 重新做一张新台子：上一张的失败计数与姿势恢复清零。
             self.table_fail = 0
+            self.table_abandon_logged = False
             self.table_recover = None
             return craft_action(obs, "crafting_table")
         if log_n >= 1 and planks < 4 and "planks" in craftable:
             return craft_action(obs, "planks")
         return None
+
+    # ------------------------------------------------------ 熔炉前台子就绪闸门（v5c）
+    def _near_surface(self, obs):
+        """公开 position 判断是否仍接近已知工作台高度（或初始地表）。"""
+        pos = self._p(obs)
+        tp = getattr(self, "table_pos", None)
+        if tp is not None:
+            return pos[1] >= float(tp[1]) - 3.0
+        return pos[1] >= 60.0
+
+    def _furnace_table_step(self, obs, counts, slots, craftable):
+        """石镐后、熔炉前的台子就绪闸门。
+
+        v5b 证据（step 2493）：石镐完成时 tables=0、planks=3、log=0 且离台
+        23.5 格后下挖——井下无树无料，37 次 `explore for wood` 全部无效。
+        这里只在公开 inventory/craftable/position/table_pos 上做有界准备：
+        - 有台或已能在台旁合成 -> 放行（None）；
+        - 有合法材料 -> 先补板/做便携台；
+        - 浅层 -> 有界找 1 个原木补台；
+        - 深井无台无料 -> 有界回台/向上兜底，禁止无限 seek wood。
+        """
+        if counts.get("stone_pickaxe", 0) < 1 or counts.get("furnace", 0) > 0:
+            return None
+        craftable = set(craftable or ())
+        tables = counts.get("crafting_table", 0)
+        planks = counts.get("planks", 0)
+        log_n = counts.get("log", 0) + counts.get("log2", 0) + counts.get("wood", 0)
+        # v5b 2493 反例：石镐完成时台子就在旁边（准星 d=1.76），但背包
+        # tables=0、planks=3、log=0；若仅凭“近台”就放行下挖，就会重演
+        # “离台 23.5 格后再无台无料”的 37 次无效循环。因此近台只有在
+        # 圆石已够当场合熔炉时才放行，否则仍先备好便携台再下井。
+        if tables >= 1:
+            self.furnace_prep_steps = 0
+            self.furnace_return_steps = 0
+            return None
+        if self._near_table(obs) and counts.get("cobblestone", 0) >= 8:
+            self.furnace_prep_steps = 0
+            self.furnace_return_steps = 0
+            return None
+        if "crafting_table" in craftable and planks >= 4:
+            self.table_fail = 0
+            self.furnace_prep_steps = 0
+            self.log("furnace readiness: craft portable table")
+            return craft_action(obs, "crafting_table")
+        if log_n >= 1 and planks < 4 and "planks" in craftable:
+            self.log("furnace readiness: craft planks")
+            return craft_action(obs, "planks")
+        if self._near_surface(obs):
+            if self.furnace_prep_steps < FURNACE_PREP_LIMIT:
+                self.furnace_prep_steps += 1
+                if self.furnace_prep_steps % 20 == 1:
+                    self.log("furnace readiness: surface wood search %d"
+                             % self.furnace_prep_steps)
+                action, _ = self.seek_and_break(obs, LOG_BLOCKS, "wood", up_scan=True)
+                return action
+            self.log("furnace readiness: surface prep timeout -> stop searching")
+            self.furnace_prep_steps = 0
+            return None
+        return self._furnace_return_step(obs)
+
+    def _furnace_return_step(self, obs):
+        """深井无台无料：有界回台/向上兜底（替代无限 explore for wood）。"""
+        self.furnace_return_steps = getattr(self, "furnace_return_steps", 0) + 1
+        if self.furnace_return_steps > FURNACE_RETURN_LIMIT:
+            if self.furnace_return_steps == FURNACE_RETURN_LIMIT + 1:
+                self.log("furnace return: bounded attempts exhausted -> stop seek wood")
+            return self.walk_policy(obs)
+        tp = getattr(self, "table_pos", None)
+        pos = self._p(obs)
+        if tp is not None:
+            desired, dist = self._yaw_to_point(pos, tp)
+            yaw = float((obs.get("orientation") or {}).get("yaw", 0.0))
+            delta = (desired - yaw + 180.0) % 360.0 - 180.0
+            if abs(delta) > 10.0:
+                k = max(-12, min(12, int(round(delta / 15.0))))
+                if k:
+                    self.log("furnace return: turn toward table (d=%.1f)" % dist)
+                    return self.turn(obs, amount=k)
+        last = getattr(self, "furnace_return_last", None)
+        moved = last is not None and self._dist2(pos, last) > 0.05
+        self.furnace_return_last = pos
+        if not moved and self.furnace_return_steps % 3 == 0:
+            self.log("furnace return: blocked -> climb up")
+            cur = float((obs.get("orientation") or {}).get("pitch", 0.0))
+            if cur > -45:
+                return self.aim_pitch(obs, -60)
+            return self.attack(obs)
+        return self.walk(obs, forward=1, jump=(self.furnace_return_steps % 4 == 0))
 
     # ------------------------------------------------------------ 统一导航状态机
     def nav_step(self, obs):
@@ -1170,6 +1268,7 @@ class Agent:
             if tables >= 1 and not self.table_placed and not self.table_pending:
                 if self.table_fail >= 3:
                     self.table_fail = 0
+                    self.table_abandon_logged = False
                     self.relocate = 12
                     self.log("table placement failed 3x -> relocate and retry")
                     return self.walk(observation, forward=1)
@@ -1273,6 +1372,12 @@ class Agent:
             pick_name = self._best_pick(counts) or (
                 "wooden_pickaxe" if spick == 0 else "stone_pickaxe")
             want = "stone_pickaxe" if spick == 0 else "furnace"
+            # v5c：石镐后、熔炉前先确保台子就绪（有界准备/回台），
+            # 避免下井后 tables=0、planks<4、无木可捡的 37 次无效 seek wood。
+            if spick >= 1 and furnace == 0:
+                action = self._furnace_table_step(observation, counts, slots, craftable)
+                if action is not None:
+                    return action
             if cobble >= need:
                 if want in craftable:
                     return craft_action(observation, want)
@@ -1287,6 +1392,20 @@ class Agent:
                 action = self._table_step(observation, counts, slots, craftable)
                 if action is not None:
                     return action
+                # v5c 实跑缺口：石镐阶段携带台在地下连续 9 次放置失败后，
+                # _table_step 返回 None，主循环落入 dependencies explore，
+                # 从未尝试回台/向上脱困（日志 2776 次 abandoned）。这里显式接入
+                # 有界回台/向上兜底；若已回到台旁则清零失败计数、重试合成。
+                if counts.get("crafting_table", 0) >= 1 and self.table_fail >= 9:
+                    if self._near_table(observation):
+                        self.table_fail = 0
+                        self.table_abandon_logged = False
+                        self.furnace_return_steps = 0
+                        self.dep_fail = 0
+                        self.log("table abandon: near table again -> retry craft")
+                    else:
+                        self.dep_fail = 0
+                        return self._furnace_return_step(observation)
                 if self.table_placed and self._near_table(observation):
                     # 台子真实在旁但 recipe 未刷新：最多等 5 步；之后必须行动。
                     # 有备用台 -> 强制在公开姿势/位置放置（不再无限 noop/dig）；
